@@ -1,0 +1,56 @@
+---
+title: Configuration
+description: "The memd config file and its defaults."
+---
+
+memd reads `~/.config/memd/config.toml`. It is created with sane defaults (and a
+freshly generated local master key) on first run, so the zero-config path just
+works.
+
+```toml
+[meilisearch]
+version = "v1.45.1"      # pinned release, downloaded + managed by memd
+host = "127.0.0.1"       # localhost only
+port = 7701
+master_key = "…"         # auto-generated, local-only
+
+[mcp]
+host = "127.0.0.1"
+port = 7702              # the always-on HTTP MCP endpoint
+
+[embedder]
+source = "huggingFace"   # runs locally inside Meilisearch
+model = "BAAI/bge-small-en-v1.5"
+default_semantic_ratio = 0.5   # 0.0 keyword .. 1.0 vector
+
+[crawler]
+roots = ["~/Projects"]
+exclude_dirs = ["node_modules", "target", ".git", "dist", "build", ".next", "vendor", ".venv", "venv", "__pycache__", ".cache"]
+max_file_bytes = 1000000
+deny_globs = ["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/*.p12", "**/*.pfx", "**/secrets*", "**/*.secret"]
+reconcile_secs = 3600
+```
+
+## Notes
+
+- **`meilisearch.version`** pins which Meilisearch binary memd downloads and
+  runs. Change it and memd fetches the new version on next start.
+- **`embedder`** controls local semantic search. To opt into a remote embedder
+  (off by default for privacy), change `source` and `model` to a supported
+  Meilisearch embedder configuration.
+- **`crawler.roots`** supports a leading `~`. Add more directories to widen
+  passive ingestion.
+
+## Filesystem layout
+
+| Path | Purpose |
+|------|---------|
+| `~/.config/memd/config.toml` | Configuration |
+| `<data dir>/bin/meilisearch-<version>` | Pinned Meilisearch binary |
+| `<data dir>/meili-data/` | Meilisearch database |
+| `<data dir>/memd.log` | Daemon log |
+| `<data dir>/memd.pid` | Daemon pid file |
+| `<data dir>/state.json` | Last crawl summary |
+
+On macOS the data dir is
+`~/Library/Application Support/com.meilisearch.memd/`.

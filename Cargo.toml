@@ -1,0 +1,36 @@
+[package]
+name = "memd"
+version = "0.1.0"
+edition = "2024"
+description = "Universal local memory daemon for LLMs, backed by Meilisearch"
+authors = ["Quentin de Quelen <quentin@meilisearch.com>"]
+license = "MIT"
+
+[[bin]]
+name = "memd"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+anyhow = "1"
+thiserror = "2"
+directories = "5"
+notify = "6"
+axum = "0.7"
+uuid = { version = "1", features = ["v7", "v4"] }
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+walkdir = "2"
+globset = "0.4"
+futures-util = "0.3"
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+tempfile = "3"

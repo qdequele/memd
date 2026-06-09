@@ -1,0 +1,78 @@
+---
+title: CLI Reference
+description: "Every memd subcommand."
+---
+
+## Daemon lifecycle
+
+| Command | Description |
+|---------|-------------|
+| `memd up [--foreground]` | Start the daemon (Meilisearch + crawler + MCP); install the launchd service. `--foreground` runs the daemon process directly. |
+| `memd down` | Stop the daemon (launchd unload, or signal the recorded pid). |
+| `memd status` | Daemon + Meilisearch health, index stats, and last crawl. |
+| `memd logs [-f]` | Print (or follow) the daemon log file. |
+| `memd serve` | Run the daemon in the foreground (used by the service runner). |
+| `memd doctor` | Diagnose Meilisearch / model / config issues. |
+
+## Memories
+
+```sh
+# Free-text memory
+memd add "We decided to ship v2 behind a flag" --type decision --tags release --scope ~/Projects/app
+
+# Annotate an important file
+memd add --file ./PRD.md --note "The product requirements document"
+
+# Search (hybrid keyword + semantic)
+memd search "release strategy" --type decision --since 30d --semantic-ratio 0.5 --limit 5
+
+# Delete
+memd forget <id>
+```
+
+`--since` accepts unix seconds or a relative span: `30d`, `12h`, `45m`, `90s`, `2w`.
+
+Memory types: `fact`, `preference`, `decision`, `task`, `project_overview`,
+`agent_instruction`, `file_annotation`, `code_note`, `reference`. When omitted,
+the type is inferred heuristically.
+
+## Crawler
+
+| Command | Description |
+|---------|-------------|
+| `memd crawl run` | Run a one-off scan of the configured roots. |
+| `memd crawl status` | Show the last crawl summary. |
+| `memd crawl config` | Print the active crawl configuration. |
+
+## MCP & service
+
+| Command | Description |
+|---------|-------------|
+| `memd mcp --stdio` | Run a stdio bridge for stdio-only clients. |
+| `memd service install` | Install the launchd service (macOS). |
+| `memd service uninstall` | Uninstall the launchd service. |
+
+## Making memd the default memory
+
+These wire memd into your agents so it's used as primary memory (see
+[MCP Server](/mcp) for the in-protocol layer that's on by default).
+
+| Command | Description |
+|---------|-------------|
+| `memd context [--scope --query --limit]` | Print relevant memories as markdown — point a Claude Code **SessionStart** hook at this to auto-inject context every session. Silent (exit 0) if the daemon is down. |
+| `memd capture` | Read a **Stop**-hook JSON payload on stdin and conservatively save the turn *only* when the user's message signals durable intent ("remember…", "we decided…", …). |
+| `memd directives install` | Write a managed memd-usage block into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, etc. (idempotent). |
+| `memd directives uninstall` | Remove the managed block. |
+
+Example `~/.claude/settings.json` hooks:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "hooks": [{ "type": "command",
+      "command": "/path/to/memd context --scope \"$CLAUDE_PROJECT_DIR\"" }] }],
+    "Stop": [{ "hooks": [{ "type": "command",
+      "command": "/path/to/memd capture" }] }]
+  }
+}
+```

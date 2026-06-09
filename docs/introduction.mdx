@@ -1,0 +1,38 @@
+---
+title: Introduction
+description: "Universal local memory daemon for LLMs, backed by Meilisearch."
+---
+
+**memd** is a single always-on service that turns a local Meilisearch instance
+into a persistent, time-aware, semantically-searchable memory layer shared
+across every LLM tool you use — Claude Code, Codex, Cursor, ChatGPT desktop, and
+anything else that speaks MCP.
+
+## The problem
+
+Every LLM tool keeps its own siloed, ephemeral notion of "memory":
+`CLAUDE.md`, `AGENTS.md`, `.cursorrules`, opaque server-side stores. Knowledge
+written in one place is invisible to every other tool, and context is rebuilt
+from scratch in every session.
+
+## The idea
+
+A local-first memory substrate that:
+
+- **Runs always-on** as a background daemon managing a dedicated local Meilisearch.
+- Is fed **actively** (any agent calls `save_memory` / `get_memory` over MCP) and
+  **passively** (a crawler indexes meaningful files already on disk).
+- Makes every memory **time-aware** and **classified** (type, tags, scope, source).
+- Is **searchable semantically** (hybrid keyword + vector), local by default.
+- Exposes **one stable MCP** that any model can mount.
+
+<Card title="North star" icon="star">
+  Open a new chat in any tool → it already knows the relevant context about your
+  machine, projects, and preferences — because they all share `memd`.
+</Card>
+
+## Privacy
+
+Local-first by design. Meilisearch is bound to `127.0.0.1` with a local-only
+key, and embeddings are computed on-device inside Meilisearch. No content leaves
+your machine unless you explicitly enable a remote embedder.

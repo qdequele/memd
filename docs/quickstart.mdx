@@ -1,0 +1,62 @@
+---
+title: Quickstart
+description: "Get memd running and store your first memory in under a minute."
+---
+
+## Install
+
+```sh
+cargo build --release
+# copy ./target/release/memd onto your PATH
+```
+
+## Start the daemon
+
+```sh
+memd up
+```
+
+This downloads the pinned Meilisearch binary, starts it as a managed child
+process on `127.0.0.1:7701`, configures the `memories` index with a local
+embedder, starts the crawler, and serves the MCP endpoint on
+`127.0.0.1:7702`. On macOS it also installs a launchd service so memd survives
+reboot.
+
+<Note>
+The embedding model is downloaded once by Meilisearch on the first memory write,
+so the very first `save` may take a little longer.
+</Note>
+
+## Save and recall
+
+```sh
+memd add "We chose Postgres for the billing service" --type decision --tags billing
+memd search "what database for billing"
+```
+
+## Check health
+
+```sh
+memd status
+memd doctor
+```
+
+## Connect an LLM tool
+
+Point any MCP client at the always-on HTTP endpoint:
+
+```
+http://127.0.0.1:7702/mcp
+```
+
+…or use the stdio bridge for stdio-only clients:
+
+```json
+{ "command": "memd", "args": ["mcp", "--stdio"] }
+```
+
+## Stop
+
+```sh
+memd down
+```

@@ -1,0 +1,57 @@
+---
+title: Architecture
+description: "How the daemon, Meilisearch, crawler, and MCP server fit together."
+---
+
+memd is one daemon that owns four cooperating components, each independently
+testable.
+
+```
+ MCP clients            memd daemon (launchd, always-on)
+ ┌───────────┐          ┌───────────────────────────────────────────┐
+ │ Claude Code│──MCP────▶│  MCP server (HTTP :7702 + stdio bridge)    │
+ │ Codex      │  HTTP   │  Crawler + file watcher (notify + periodic)│
+ │ Cursor …   │  /stdio │  Memory service (classify·dedup·timestamp) │
+ └───────────┘          │  Meilisearch (managed child proc :7701)    │
+                        │    └ index: memories  (local embedder)     │
+                        └───────────────────────────────────────────┘
+```
+
+## Components
+
+<AccordionGroup>
+  <Accordion title="Meilisearch manager">
+    Downloads and pins a Meilisearch binary (no Docker), starts/stops/health-checks
+    it as a child process on a dedicated localhost port, and owns its lifecycle.
+    On first run it enables the vector store and configures the index embedder.
+  </Accordion>
+  <Accordion title="Memory service (core)">
+    CRUD over memories: heuristic classification, content-hash dedup, timestamp
+    stamping, and hybrid search. Embedding is delegated entirely to Meilisearch —
+    memd never computes vectors itself.
+  </Accordion>
+  <Accordion title="MCP server">
+    A thin JSON-RPC 2.0 adapter exposing the memory tools over the wire. HTTP
+    (streamable) is the always-on primary transport; a stdio bridge serves
+    stdio-only clients.
+  </Accordion>
+  <Accordion title="Crawler + watcher">
+    Config-driven roots/globs: an initial scan, `notify`-based incremental
+    updates, and a periodic reconcile. Handles deletions and maps files to
+    memory items by filename heuristics.
+  </Accordion>
+</AccordionGroup>
+
+## Why a daemon *and* an MCP server
+
+MCP stdio servers are spawned per client and die with it — incompatible with
+"memory maintained all the time." So the daemon (`memd serve`, under launchd)
+owns the always-on parts and exposes an HTTP MCP endpoint that many clients
+share. The stdio bridge is a thin shim to the same local store.
+
+## Embeddings
+
+The `memories` index is configured with a Meilisearch embedder of source
+`huggingFace`, which downloads and runs the embedding model in-process within
+Meilisearch on the local machine. memd only sends documents; Meilisearch embeds
+them locally on add/update. Nothing leaves the box.

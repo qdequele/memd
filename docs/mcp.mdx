@@ -1,0 +1,117 @@
+---
+title: MCP Server
+description: "Mount memd as a Model Context Protocol server in any client."
+---
+
+memd exposes one stable MCP server over two transports.
+
+## Transports
+
+<Tabs>
+  <Tab title="HTTP (always-on)">
+    The daemon serves a streamable-HTTP MCP endpoint. Point your client at:
+
+    ```
+    http://127.0.0.1:7702/mcp
+    ```
+
+    One shared server, many clients — the recommended setup.
+  </Tab>
+  <Tab title="stdio bridge">
+    For stdio-only clients, configure:
+
+    ```json
+    { "command": "memd", "args": ["mcp", "--stdio"] }
+    ```
+
+    The bridge talks directly to the local Meilisearch managed by the daemon.
+  </Tab>
+</Tabs>
+
+## Tools
+
+The MVP contract is `save_memory` + `get_memory`; the rest are additive.
+
+### `save_memory`
+
+Persist a memory. Stamps timestamps, classifies the type if omitted, dedups
+identical content, and embeds it locally.
+
+```json
+{
+  "content": "We chose Postgres for billing",
+  "type": "decision",
+  "tags": ["billing"],
+  "scope": "~/Projects/app",
+  "title": "Billing DB choice"
+}
+```
+
+Returns `{ "id": "…" }`. Only `content` is required.
+
+### `get_memory`
+
+Recall memories by hybrid (keyword + semantic) search. Returns **lightweight
+rows**: metadata plus a query-aware ~50-word highlighted **snippet** of
+`content` — not the full blob. Bumps `last_accessed_at` on hits.
+
+```json
+{
+  "query": "what database for billing",
+  "limit": 5,
+  "offset": 0,
+  "type": "decision",
+  "scope": "~/Projects/app",
+  "since": 1714521600,
+  "until": 1717200000,
+  "semantic_ratio": 0.5,
+  "crop_length": 50,
+  "include_content": false,
+  "highlight": true,
+  "facets": ["type", "scope"]
+}
+```
+
+Returns `{ "count": n, "estimatedTotalHits": N, "memories": [ … ], "facets"?: {…} }`.
+Only `query` is required.
+
+### `read_memory`
+
+Fetch the **full** document (complete `content`) for a single memory by id —
+the end of the recall funnel.
+
+```json
+{ "id": "019e…" }
+```
+
+### The recall funnel
+
+Results are kept small enough to stay inside the tool-result budget:
+
+<Steps>
+  <Step title="Search or list">
+    `get_memory` / `list_memories` return lightweight rows (snippet or metadata only).
+  </Step>
+  <Step title="Read on demand">
+    `read_memory(id)` fetches the full content for the row you want.
+  </Step>
+</Steps>
+
+This maps onto Meilisearch's native `attributesToRetrieve`, `attributesToCrop` /
+`cropLength`, `attributesToHighlight`, and `facets` — all projection, cropping,
+highlighting, and grouped counts happen server-side.
+
+### Phase-2 tools
+
+| Tool | Arguments | Description |
+|------|-----------|-------------|
+| `update_memory` | `id`, plus any of `content`, `title`, `tags`, `scope`, `type` | Patch an existing memory. |
+| `forget_memory` | `id` | Delete a memory. |
+| `list_memories` | `type?`, `scope?`, `limit?`, `offset?`, `include_content?`, `crop_length?`, `facets?` | List recent memories — metadata-only by default. |
+| `stats` | `group_by?` | Document count + server-side facet counts (default: type/scope/source). |
+
+## Protocol
+
+memd implements JSON-RPC 2.0 with the standard MCP methods: `initialize`,
+`ping`, `tools/list`, and `tools/call`. Notifications (no `id`) receive no
+response. The advertised protocol version is `2024-11-05`.

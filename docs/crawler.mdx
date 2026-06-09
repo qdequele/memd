@@ -1,0 +1,44 @@
+---
+title: Crawler
+description: "Passive ingestion of meaningful files already on disk."
+---
+
+The crawler indexes knowledge that already exists on your machine and keeps it
+in sync — so memories aren't limited to what agents explicitly write.
+
+## What it indexes
+
+| Pattern | Mapped type |
+|---------|-------------|
+| `README*` | `project_overview` |
+| `CLAUDE.md`, `AGENTS.md`, `agent.md`, `.cursorrules`, `.github/copilot-instructions.md` | `agent_instruction` |
+| `MEMORY.md`, files under a `memory/` or `.claude/` directory | `fact` |
+
+## How it stays in sync
+
+- **Initial scan** of every configured root on startup.
+- **Incremental updates** via a `notify` filesystem watcher (create / modify / remove).
+- **Periodic reconcile** (`reconcile_secs`) to catch missed events.
+- **Deletions** remove the corresponding document.
+- **Stable ids** derived from the file path; a `content_hash` skips re-embedding
+  unchanged files.
+
+## Scope
+
+Each crawled file is scoped to its project directory (the configured root plus
+the first path component below it), enabling project-scoped recall via the
+`scope` filter.
+
+## Secrets hygiene
+
+The crawler skips excluded directories (`node_modules`, `target`, `.git`, …) and
+never indexes files matching the denylist (`**/.env`, `**/*.pem`, `**/*.key`, …).
+Files larger than `max_file_bytes` are skipped.
+
+## Commands
+
+```sh
+memd crawl run      # one-off scan
+memd crawl status   # last summary
+memd crawl config   # active configuration
+```
