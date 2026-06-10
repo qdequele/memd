@@ -84,6 +84,9 @@ pub async fn serve() -> Result<()> {
     let _ = std::fs::remove_file(paths::pid_file()?);
 
     if restart {
+        // Flush buffered log lines before exec replaces the process image —
+        // the appender guard's Drop never runs past this point.
+        drop(_guard);
         restart_daemon();
     }
     Ok(())

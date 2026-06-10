@@ -43,10 +43,6 @@ impl UpdateState {
             .unwrap_or_default()
     }
 
-    pub fn save(&self) -> Result<()> {
-        self.save_to(&paths::update_state_file()?)
-    }
-
     pub fn engine_version_failed(&self, version: &str) -> bool {
         self.failed_engine_versions.iter().any(|v| v == version)
     }
