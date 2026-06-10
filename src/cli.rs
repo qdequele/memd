@@ -12,7 +12,6 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use time;
 
 /// Start the daemon. In foreground mode this *is* the daemon; otherwise it
 /// installs the launchd service (macOS) or spawns a detached process.
@@ -1059,12 +1058,19 @@ pub async fn update(check_only: bool) -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         cfg.meilisearch.version
     );
-    let memd_rel = crate::update::check::latest_release(crate::update::check::MEMD_REPO)
-        .await
-        .ok();
-    let engine_rel = crate::update::check::latest_release(crate::update::check::ENGINE_REPO)
-        .await
-        .ok();
+    let memd_res = crate::update::check::latest_release(crate::update::check::MEMD_REPO).await;
+    let engine_res = crate::update::check::latest_release(crate::update::check::ENGINE_REPO).await;
+    if let Err(e) = &memd_res {
+        eprintln!("warning: could not check memd releases: {e:#}");
+    }
+    if let Err(e) = &engine_res {
+        eprintln!("warning: could not check Meilisearch releases: {e:#}");
+    }
+    if memd_res.is_err() && engine_res.is_err() {
+        bail!("GitHub is unreachable — try again later");
+    }
+    let memd_rel = memd_res.ok();
+    let engine_rel = engine_res.ok();
     let asset = crate::update::check::memd_asset_name()?;
     let plan = crate::update::check::decide(
         memd_rel.as_ref(),
@@ -1090,8 +1096,9 @@ pub async fn update(check_only: bool) -> Result<()> {
             crate::update::self_update::apply(&asset_url, &version, &installed).await?;
             println!("memd updated to {version} at {}", installed.display());
             state.last_result = format!("memd updated to {version}");
+            state.last_check_secs = now_secs();
             state.save_to(&state_path)?;
-            restart_service().await?;
+            restart_service(&cfg).await?;
             println!("Run `memd update` again to check for engine updates.");
         }
         crate::update::check::Plan::Engine { version } => {
@@ -1104,27 +1111,39 @@ pub async fn update(check_only: bool) -> Result<()> {
             }
             let svc = MemoryService::from_config(&cfg);
             if !svc.client().is_healthy().await {
-                bail!("the daemon must be running to migrate the engine — run `memd up` first");
+                bail!("the Meilisearch engine must be running to migrate — run `memd up` first");
             }
             let _lock = crate::update::UpdateLock::acquire()?;
             crate::update::engine::prepare(&cfg, svc.client(), &version).await?;
             state.last_result = format!("engine migration to {version} prepared");
+            state.last_check_secs = now_secs();
             state.save_to(&state_path)?;
             println!("Engine migration to {version} prepared; restarting the daemon to apply…");
-            restart_service().await?;
+            restart_service(&cfg).await?;
             println!("Check `memd status` — the import may take a moment on large stores.");
         }
     }
     Ok(())
 }
 
-/// Restart the daemon so a swapped binary / prepared migration takes effect.
-async fn restart_service() -> Result<()> {
+/// Restart the daemon so a swapped binary / prepared migration takes effect,
+/// then poll until it reports healthy again (engine imports can take longer —
+/// we report, not fail, on timeout).
+async fn restart_service(cfg: &Config) -> Result<()> {
     if launchd::is_installed() {
         launchd::unload()?;
         tokio::time::sleep(Duration::from_millis(500)).await;
         launchd::load()?;
-        println!("Service restarted.");
+        for _ in 0..40 {
+            if daemon_healthy(cfg).await {
+                println!("Service restarted.");
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        println!(
+            "Service reloaded but not healthy yet (an engine import can take a while) — check `memd status` / `memd logs`."
+        );
     } else {
         println!(
             "No launchd service installed — restart the daemon manually (`memd down && memd up`)."
