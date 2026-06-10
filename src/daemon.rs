@@ -96,16 +96,16 @@ pub async fn serve() -> Result<()> {
 /// platforms without one. Never returns.
 fn restart_daemon() -> ! {
     if crate::launchd::is_installed() {
-        tracing::info!("exiting for restart; launchd will relaunch");
+        eprintln!("memd: exiting for restart; launchd will relaunch");
         std::process::exit(0);
     }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
         let exe = crate::cli::resolve_memd_exe();
-        tracing::info!("re-exec {} serve", exe.display());
+        eprintln!("memd: re-exec {} serve", exe.display());
         let err = std::process::Command::new(exe).arg("serve").exec();
-        tracing::error!("re-exec failed: {err}");
+        eprintln!("memd: re-exec failed: {err}");
         std::process::exit(1);
     }
     #[cfg(not(unix))]

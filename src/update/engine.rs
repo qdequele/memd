@@ -133,10 +133,20 @@ pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
         std::fs::rename(&db, &backup).with_context(|| format!("backing up {}", db.display()))?;
     }
 
-    match import_and_verify(cfg, &m).await {
+    let outcome = async {
+        import_and_verify(cfg, &m).await?;
+        cfg.meilisearch.version = m.to.clone();
+        if let Err(e) = cfg.save() {
+            // Un-pin in memory: the daemon continues on the old version.
+            cfg.meilisearch.version = m.from.clone();
+            return Err(e.context("persisting new engine version to config"));
+        }
+        Ok(())
+    }
+    .await;
+
+    match outcome {
         Ok(()) => {
-            cfg.meilisearch.version = m.to.clone();
-            cfg.save()?;
             prune_backups(&db)?;
             let _ = std::fs::remove_file(&m.dump_path);
             tracing::info!("engine migrated to {}", m.to);
@@ -151,6 +161,7 @@ pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
                     backup.display()
                 );
             }
+            let _ = std::fs::remove_file(&m.dump_path);
             let state_path = paths::update_state_file()?;
             let mut state = UpdateState::load_from(&state_path);
             state.record_engine_failure(&m.to);

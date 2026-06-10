@@ -162,8 +162,13 @@ async fn tick(
     state: &mut UpdateState,
 ) -> Result<Option<&'static str>> {
     let _lock = UpdateLock::acquire()?;
-    let memd_rel = check::latest_release(check::MEMD_REPO).await.ok();
-    let engine_rel = check::latest_release(check::ENGINE_REPO).await.ok();
+    let memd_res = check::latest_release(check::MEMD_REPO).await;
+    let engine_res = check::latest_release(check::ENGINE_REPO).await;
+    if let (Err(memd_err), Err(_)) = (&memd_res, &engine_res) {
+        anyhow::bail!("GitHub unreachable: {memd_err:#}");
+    }
+    let memd_rel = memd_res.ok();
+    let engine_rel = engine_res.ok();
     let asset = check::memd_asset_name()?;
     let plan = check::decide(
         memd_rel.as_ref(),
@@ -175,7 +180,14 @@ async fn tick(
     );
     match plan {
         check::Plan::None => {
-            state.last_result = "up to date".into();
+            state.last_result = if state.failed_engine_versions.is_empty() {
+                "up to date".into()
+            } else {
+                format!(
+                    "up to date (engine versions held back after failed migration: {})",
+                    state.failed_engine_versions.join(", ")
+                )
+            };
             Ok(None)
         }
         check::Plan::Memd { version, asset_url } => {

@@ -1001,7 +1001,10 @@ async fn fix_db_mismatch() -> Result<()> {
     }
     let db = paths::meili_db_dir()?;
     if db.exists() {
-        let backup = db.with_file_name(format!("meili-data.bak.{}", now_secs()));
+        // Distinct prefix: `meili-data.bak.*` is reserved for migration backups,
+        // which the updater auto-restores when the db dir is missing — this one
+        // must stay stranded (it is version-incompatible by definition).
+        let backup = db.with_file_name(format!("meili-data.mismatch.{}", now_secs()));
         std::fs::rename(&db, &backup).with_context(|| format!("backing up {}", db.display()))?;
         println!("  backed up old database -> {}", backup.display());
     }
@@ -1146,7 +1149,7 @@ async fn restart_service(cfg: &Config) -> Result<()> {
         );
     } else {
         println!(
-            "No launchd service installed — restart the daemon manually (`memd down && memd up`)."
+            "No launchd service installed — restart the daemon manually (`memd down && memd up`). A prepared engine migration expires after 1 hour."
         );
     }
     Ok(())
