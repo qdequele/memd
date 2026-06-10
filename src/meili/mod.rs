@@ -46,7 +46,13 @@ pub fn db_version() -> Result<Option<String>> {
 
 /// Download the pinned Meilisearch binary if it is not already present.
 pub async fn ensure_binary(cfg: &Config) -> Result<PathBuf> {
-    let version = &cfg.meilisearch.version;
+    download_binary(&cfg.meilisearch.version).await
+}
+
+/// Download the Meilisearch binary for `version` (a git tag like `v1.45.1`)
+/// into memd's bin dir, if not already present. Binaries are stored per
+/// version, so older ones remain available for rollback.
+pub async fn download_binary(version: &str) -> Result<PathBuf> {
     let dest = binary_path(version)?;
     if dest.exists() {
         return Ok(dest);
@@ -101,6 +107,15 @@ pub async fn ensure_binary(cfg: &Config) -> Result<PathBuf> {
 /// `stdout`/`stderr` are inherited so the daemon's log redirection captures
 /// them. The caller owns the returned [`Child`] and its lifecycle.
 pub async fn spawn(cfg: &Config) -> Result<Child> {
+    spawn_with_import(cfg, None).await
+}
+
+/// Like [`spawn`], but optionally boot with `--import-dump` (used by engine
+/// migration; requires an empty database directory).
+pub async fn spawn_with_import(
+    cfg: &Config,
+    import_dump: Option<&std::path::Path>,
+) -> Result<Child> {
     let bin = ensure_binary(cfg).await?;
     let db = paths::meili_db_dir()?;
     std::fs::create_dir_all(&db)?;
@@ -117,8 +132,8 @@ pub async fn spawn(cfg: &Config) -> Result<Child> {
     let addr = format!("{}:{}", cfg.meilisearch.host, cfg.meilisearch.port);
     tracing::info!("starting Meilisearch on {addr}");
 
-    let child = Command::new(&bin)
-        .current_dir(&data)
+    let mut cmd = Command::new(&bin);
+    cmd.current_dir(&data)
         .arg("--db-path")
         .arg(&db)
         .arg("--dump-dir")
@@ -131,7 +146,11 @@ pub async fn spawn(cfg: &Config) -> Result<Child> {
         .arg(&cfg.meilisearch.master_key)
         .arg("--no-analytics")
         .arg("--env")
-        .arg("production")
+        .arg("production");
+    if let Some(dump) = import_dump {
+        cmd.arg("--import-dump").arg(dump);
+    }
+    let child = cmd
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
