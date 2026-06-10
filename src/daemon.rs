@@ -4,17 +4,32 @@
 
 use crate::config::Config;
 use crate::memory::MemoryService;
-use crate::{crawler, mcp, meili, paths};
+use crate::{crawler, mcp, meili, paths, update};
 use anyhow::{Context, Result};
 use std::time::Duration;
 
 /// Run the daemon until terminated. Blocks for the lifetime of the service.
 pub async fn serve() -> Result<()> {
     let _guard = init_logging()?;
-    let cfg = Config::load_or_init()?;
+    let mut cfg = Config::load_or_init()?;
 
     write_pid()?;
     tracing::info!("memd daemon starting (pid {})", std::process::id());
+
+    // 0. Apply a prepared engine migration before the engine starts. Failure
+    //    rolls back and the daemon continues on the previous version.
+    match update::engine::apply_pending(&mut cfg).await? {
+        update::engine::Applied::Migrated { to } => {
+            tracing::info!("engine updated to {to}");
+        }
+        update::engine::Applied::RolledBack { to, error } => {
+            tracing::warn!("engine update to {to} rolled back: {error}");
+        }
+        update::engine::Applied::Expired { to } => {
+            tracing::info!("stale engine migration to {to} discarded; will re-prepare");
+        }
+        update::engine::Applied::None => {}
+    }
 
     // 1. Start the managed Meilisearch child process.
     let mut child = meili::spawn(&cfg).await?;
@@ -51,35 +66,80 @@ pub async fn serve() -> Result<()> {
         }
     });
 
-    // 5. Wait for shutdown signal or child exit.
-    shutdown_signal(&mut child).await;
+    // 5. Daily auto-update check; a prepared update requests a restart.
+    let (restart_tx, mut restart_rx) = tokio::sync::mpsc::channel::<&'static str>(1);
+    let upd_cfg = cfg.clone();
+    let updater = tokio::spawn(async move {
+        update::run_loop(upd_cfg, restart_tx).await;
+    });
+
+    // 6. Wait for a shutdown signal, child exit, or a restart request.
+    let restart = shutdown_signal(&mut child, &mut restart_rx).await;
 
     tracing::info!("shutting down");
     crawler_task.abort();
     server.abort();
+    updater.abort();
     let _ = child.kill().await;
     let _ = std::fs::remove_file(paths::pid_file()?);
+
+    if restart {
+        restart_daemon();
+    }
     Ok(())
 }
 
-/// Block until SIGINT/SIGTERM, or until the Meilisearch child exits.
-async fn shutdown_signal(child: &mut tokio::process::Child) {
+/// Exit so the supervisor relaunches us (launchd `KeepAlive`), or re-exec on
+/// platforms without one. Never returns.
+fn restart_daemon() -> ! {
+    if crate::launchd::is_installed() {
+        tracing::info!("exiting for restart; launchd will relaunch");
+        std::process::exit(0);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let exe = crate::cli::resolve_memd_exe();
+        tracing::info!("re-exec {} serve", exe.display());
+        let err = std::process::Command::new(exe).arg("serve").exec();
+        tracing::error!("re-exec failed: {err}");
+        std::process::exit(1);
+    }
+    #[cfg(not(unix))]
+    std::process::exit(0);
+}
+
+/// Block until SIGINT/SIGTERM, the Meilisearch child exiting, or a restart
+/// request from the updater. Returns true when the daemon should restart
+/// itself after cleanup.
+async fn shutdown_signal(
+    child: &mut tokio::process::Child,
+    restart_rx: &mut tokio::sync::mpsc::Receiver<&'static str>,
+) -> bool {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
         let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
         tokio::select! {
-            _ = term.recv() => tracing::info!("received SIGTERM"),
-            _ = int.recv() => tracing::info!("received SIGINT"),
-            status = child.wait() => tracing::error!("Meilisearch exited: {status:?}"),
+            _ = term.recv() => { tracing::info!("received SIGTERM"); false }
+            _ = int.recv() => { tracing::info!("received SIGINT"); false }
+            status = child.wait() => { tracing::error!("Meilisearch exited: {status:?}"); false }
+            reason = restart_rx.recv() => {
+                tracing::info!("restart requested: {}", reason.unwrap_or("unknown"));
+                true
+            }
         }
     }
     #[cfg(not(unix))]
     {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => tracing::info!("received ctrl-c"),
-            status = child.wait() => tracing::error!("Meilisearch exited: {status:?}"),
+            _ = tokio::signal::ctrl_c() => { tracing::info!("received ctrl-c"); false }
+            status = child.wait() => { tracing::error!("Meilisearch exited: {status:?}"); false }
+            reason = restart_rx.recv() => {
+                tracing::info!("restart requested: {}", reason.unwrap_or("unknown"));
+                true
+            }
         }
     }
 }
