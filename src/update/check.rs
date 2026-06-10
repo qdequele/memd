@@ -84,9 +84,14 @@ pub async fn latest_release(repo: &str) -> Result<Release> {
 pub enum Plan {
     None,
     /// Replace the memd binary with this release.
-    Memd { version: String, asset_url: String },
+    Memd {
+        version: String,
+        asset_url: String,
+    },
     /// Migrate the engine to this version (tag, e.g. `v1.46.0`).
-    Engine { version: String },
+    Engine {
+        version: String,
+    },
 }
 
 /// Decide the next update. memd takes priority over the engine so engine

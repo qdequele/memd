@@ -81,6 +81,7 @@ It's **idempotent** — re-run any time (e.g. after an upgrade) to reconverge.
 - **🪶 Token-safe by design** — search returns lightweight snippets, not blobs; fetch
   the full text only when you ask.
 - **🔒 Local-first** — bound to `127.0.0.1`, local-only key, no cloud by default.
+- **Self-updating** — a daily check keeps memd and its Meilisearch engine current; engine upgrades migrate via dump/import with automatic rollback.
 
 ---
 

@@ -29,7 +29,16 @@ exclude_dirs = ["node_modules", "target", ".git", "dist", "build", ".next", "ven
 max_file_bytes = 1000000
 deny_globs = ["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/id_rsa*", "**/*.p12", "**/*.pfx", "**/secrets*", "**/*.secret"]
 reconcile_secs = 3600
+
+[update]
+auto = true              # daily GitHub check; set to false to update only via `memd update`
 ```
+
+## `[update]`
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `auto` | `true` | Apply memd and engine updates found by the daemon's daily GitHub check. Set to `false` to update only via `memd update`. |
 
 ## Notes
 

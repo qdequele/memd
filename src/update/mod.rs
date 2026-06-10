@@ -187,10 +187,8 @@ async fn tick(
         }
         check::Plan::Engine { version } => {
             tracing::info!("engine update available: {version}");
-            let client = crate::meili::MeiliClient::new(
-                cfg.meili_url(),
-                cfg.meilisearch.master_key.clone(),
-            );
+            let client =
+                crate::meili::MeiliClient::new(cfg.meili_url(), cfg.meilisearch.master_key.clone());
             engine::prepare(cfg, &client, &version).await?;
             state.last_result = format!("engine migration to {version} prepared");
             Ok(Some("engine migration"))

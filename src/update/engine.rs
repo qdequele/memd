@@ -48,10 +48,16 @@ impl Migration {
 /// While the daemon is up: dump the live instance, fetch the new binary, and
 /// leave a marker for the next startup. Does not touch the running engine.
 pub async fn prepare(cfg: &Config, client: &MeiliClient, to_version: &str) -> Result<()> {
-    let dump_uid = client.create_dump().await.context("dumping live instance")?;
+    let dump_uid = client
+        .create_dump()
+        .await
+        .context("dumping live instance")?;
     let dump_path = paths::dumps_dir()?.join(format!("{dump_uid}.dump"));
     if !dump_path.exists() {
-        bail!("dump file {} not found after dump task", dump_path.display());
+        bail!(
+            "dump file {} not found after dump task",
+            dump_path.display()
+        );
     }
     // A missing index (fresh store) legitimately has zero documents; any other
     // stats failure must abort — otherwise verification would be vacuous.
@@ -111,7 +117,11 @@ pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
         tracing::warn!(
             "discarding stale engine migration to {} (prepared {}s ago); the next daily check will re-prepare it",
             m.to,
-            if m.prepared_at == 0 { -1 } else { now_secs() - m.prepared_at }
+            if m.prepared_at == 0 {
+                -1
+            } else {
+                now_secs() - m.prepared_at
+            }
         );
         let _ = std::fs::remove_file(&m.dump_path);
         return Ok(Applied::Expired { to: m.to });
@@ -120,8 +130,7 @@ pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
     tracing::info!("applying engine migration {} -> {}", m.from, m.to);
     let backup = db.with_file_name(format!("meili-data.bak.{}", now_secs()));
     if db.exists() {
-        std::fs::rename(&db, &backup)
-            .with_context(|| format!("backing up {}", db.display()))?;
+        std::fs::rename(&db, &backup).with_context(|| format!("backing up {}", db.display()))?;
     }
 
     match import_and_verify(cfg, &m).await {
@@ -250,8 +259,7 @@ fn restore_backup(db: &Path, backup: &Path) -> Result<()> {
             .with_context(|| format!("removing half-imported {}", db.display()))?;
     }
     if backup.exists() {
-        std::fs::rename(backup, db)
-            .with_context(|| format!("restoring {}", backup.display()))?;
+        std::fs::rename(backup, db).with_context(|| format!("restoring {}", backup.display()))?;
     }
     Ok(())
 }
@@ -370,7 +378,10 @@ mod tests {
         }
         assert!(recover_stranded_backup(&db).unwrap());
         assert_eq!(std::fs::read_to_string(db.join("VERSION")).unwrap(), "200");
-        assert!(dir.path().join("meili-data.bak.100").exists(), "older backup untouched");
+        assert!(
+            dir.path().join("meili-data.bak.100").exists(),
+            "older backup untouched"
+        );
         // With the db present, recovery is a no-op.
         assert!(!recover_stranded_backup(&db).unwrap());
     }

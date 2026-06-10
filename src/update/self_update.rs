@@ -41,11 +41,9 @@ async fn download_and_swap(
     let tmp_owned = tmp.to_path_buf();
     let installed_owned = installed.to_path_buf();
     let expected = expected_version.to_string();
-    tokio::task::spawn_blocking(move || {
-        verify_and_swap(&tmp_owned, &installed_owned, &expected)
-    })
-    .await
-    .context("verify task panicked")?
+    tokio::task::spawn_blocking(move || verify_and_swap(&tmp_owned, &installed_owned, &expected))
+        .await
+        .context("verify task panicked")?
 }
 
 /// Stream `url` to `dest`.
@@ -95,7 +93,11 @@ fn verify_version(bin: &Path, expected_version: &str) -> Result<()> {
 }
 
 /// Inner implementation of version verification with a configurable timeout.
-fn verify_version_with_timeout(bin: &Path, expected_version: &str, timeout: Duration) -> Result<()> {
+fn verify_version_with_timeout(
+    bin: &Path,
+    expected_version: &str,
+    timeout: Duration,
+) -> Result<()> {
     use std::process::Stdio;
     let mut child = std::process::Command::new(bin)
         .arg("--version")
@@ -192,7 +194,8 @@ mod tests {
         let mut perms = std::fs::metadata(&p).unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&p, perms).unwrap();
-        let err = verify_version_with_timeout(&p, "v0.2.0", Duration::from_millis(200)).unwrap_err();
+        let err =
+            verify_version_with_timeout(&p, "v0.2.0", Duration::from_millis(200)).unwrap_err();
         assert!(err.to_string().contains("timeout"), "got: {err}");
     }
 }
