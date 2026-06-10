@@ -99,12 +99,28 @@ fn verify_version_with_timeout(
     timeout: Duration,
 ) -> Result<()> {
     use std::process::Stdio;
-    let mut child = std::process::Command::new(bin)
-        .arg("--version")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("running {} --version", bin.display()))?;
+    // Retry ETXTBSY (os error 26): on Linux, exec of a just-written file fails
+    // with "text file busy" while any concurrently-forked child still holds a
+    // write fd inherited across fork (tokio worker threads, parallel tests).
+    // The fd closes as soon as that child execs, so a short retry suffices.
+    let mut attempts = 0;
+    let mut child = loop {
+        match std::process::Command::new(bin)
+            .arg("--version")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => break child,
+            Err(e) if e.raw_os_error() == Some(26) && attempts < 20 => {
+                attempts += 1;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(e).with_context(|| format!("running {} --version", bin.display()));
+            }
+        }
+    };
     let deadline = std::time::Instant::now() + timeout;
     // Reading stdout after exit is safe here: --version output is far below
     // the pipe buffer size, so the child never blocks on a full pipe.
