@@ -12,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use time;
 
 /// Start the daemon. In foreground mode this *is* the daemon; otherwise it
 /// installs the launchd service (macOS) or spawns a detached process.
@@ -112,6 +113,17 @@ pub async fn status() -> Result<()> {
             "not installed"
         }
     );
+
+    let upd = crate::update::UpdateState::load();
+    if upd.last_check_secs > 0 {
+        println!(
+            "Updates:      last check {} — {}",
+            format_ts(upd.last_check_secs),
+            upd.last_result
+        );
+    } else {
+        println!("Updates:      never checked (daily check runs in the daemon)");
+    }
 
     match crawler::last_summary() {
         Some(s) => println!(
@@ -635,6 +647,17 @@ fn health_label(up: bool) -> &'static str {
     if up { "up" } else { "down" }
 }
 
+/// Format unix seconds as RFC3339 for human output.
+fn format_ts(secs: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| secs.to_string())
+}
+
 /// Spawn `memd serve` as a detached background process (non-macOS path).
 fn spawn_detached() -> Result<()> {
     let exe = std::env::current_exe()?;
@@ -1022,4 +1045,90 @@ unsafe fn libc_kill(pid: i32, sig: i32) {
     unsafe {
         kill(pid, sig);
     }
+}
+
+/// Check for updates; apply them unless `check_only`. Manual counterpart of
+/// the daemon's daily check — takes the same lock so the two never race.
+pub async fn update(check_only: bool) -> Result<()> {
+    let cfg = Config::load_or_init()?;
+    let state_path = paths::update_state_file()?;
+    let mut state = crate::update::UpdateState::load_from(&state_path);
+
+    println!(
+        "memd {} (engine pinned {}) — checking GitHub…",
+        env!("CARGO_PKG_VERSION"),
+        cfg.meilisearch.version
+    );
+    let memd_rel = crate::update::check::latest_release(crate::update::check::MEMD_REPO)
+        .await
+        .ok();
+    let engine_rel = crate::update::check::latest_release(crate::update::check::ENGINE_REPO)
+        .await
+        .ok();
+    let asset = crate::update::check::memd_asset_name()?;
+    let plan = crate::update::check::decide(
+        memd_rel.as_ref(),
+        engine_rel.as_ref(),
+        env!("CARGO_PKG_VERSION"),
+        &cfg.meilisearch.version,
+        &state,
+        asset,
+    );
+
+    match plan {
+        crate::update::check::Plan::None => {
+            println!("Everything is up to date.");
+            return Ok(());
+        }
+        crate::update::check::Plan::Memd { version, asset_url } => {
+            if check_only {
+                println!("memd {version} is available (run `memd update` to apply).");
+                return Ok(());
+            }
+            let _lock = crate::update::UpdateLock::acquire()?;
+            let installed = paths::installed_bin()?;
+            crate::update::self_update::apply(&asset_url, &version, &installed).await?;
+            println!("memd updated to {version} at {}", installed.display());
+            state.last_result = format!("memd updated to {version}");
+            state.save_to(&state_path)?;
+            restart_service().await?;
+            println!("Run `memd update` again to check for engine updates.");
+        }
+        crate::update::check::Plan::Engine { version } => {
+            if check_only {
+                println!(
+                    "Meilisearch engine {version} is available (pinned {}).",
+                    cfg.meilisearch.version
+                );
+                return Ok(());
+            }
+            let svc = MemoryService::from_config(&cfg);
+            if !svc.client().is_healthy().await {
+                bail!("the daemon must be running to migrate the engine — run `memd up` first");
+            }
+            let _lock = crate::update::UpdateLock::acquire()?;
+            crate::update::engine::prepare(&cfg, svc.client(), &version).await?;
+            state.last_result = format!("engine migration to {version} prepared");
+            state.save_to(&state_path)?;
+            println!("Engine migration to {version} prepared; restarting the daemon to apply…");
+            restart_service().await?;
+            println!("Check `memd status` — the import may take a moment on large stores.");
+        }
+    }
+    Ok(())
+}
+
+/// Restart the daemon so a swapped binary / prepared migration takes effect.
+async fn restart_service() -> Result<()> {
+    if launchd::is_installed() {
+        launchd::unload()?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        launchd::load()?;
+        println!("Service restarted.");
+    } else {
+        println!(
+            "No launchd service installed — restart the daemon manually (`memd down && memd up`)."
+        );
+    }
+    Ok(())
 }
