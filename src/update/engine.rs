@@ -13,6 +13,10 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// A prepared migration older than this is discarded: writes made after the
+/// dump are not in it, so applying a stale dump would silently drop them.
+const MAX_MARKER_AGE_SECS: i64 = 3600;
+
 /// Marker file describing a prepared migration (`engine-migration.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Migration {
@@ -21,6 +25,9 @@ pub struct Migration {
     pub dump_path: PathBuf,
     /// Documents in the memories index when the dump was taken.
     pub expected_docs: u64,
+    /// Unix seconds when the dump was taken (`0` in markers from older builds).
+    #[serde(default)]
+    pub prepared_at: i64,
 }
 
 impl Migration {
@@ -32,7 +39,9 @@ impl Migration {
 
     pub fn save_to(&self, path: &Path) -> Result<()> {
         let raw = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, raw).with_context(|| format!("writing {}", path.display()))
+        let tmp = path.with_extension("json.tmp");
+        std::fs::write(&tmp, raw).with_context(|| format!("writing {}", tmp.display()))?;
+        std::fs::rename(&tmp, path).with_context(|| format!("committing {}", path.display()))
     }
 }
 
@@ -44,12 +53,16 @@ pub async fn prepare(cfg: &Config, client: &MeiliClient, to_version: &str) -> Re
     if !dump_path.exists() {
         bail!("dump file {} not found after dump task", dump_path.display());
     }
-    let expected_docs = client
-        .stats()
-        .await
-        .ok()
-        .and_then(|s| s.get("numberOfDocuments").and_then(|n| n.as_u64()))
-        .unwrap_or(0);
+    // A missing index (fresh store) legitimately has zero documents; any other
+    // stats failure must abort — otherwise verification would be vacuous.
+    let expected_docs = match client.stats().await {
+        Ok(s) => s
+            .get("numberOfDocuments")
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0),
+        Err(e) if format!("{e:#}").contains("index_not_found") => 0,
+        Err(e) => return Err(e).context("reading index stats before migration"),
+    };
     meili::download_binary(to_version)
         .await
         .context("downloading new engine binary")?;
@@ -58,6 +71,7 @@ pub async fn prepare(cfg: &Config, client: &MeiliClient, to_version: &str) -> Re
         to: to_version.to_string(),
         dump_path,
         expected_docs,
+        prepared_at: now_secs(),
     };
     m.save_to(&paths::engine_migration_file()?)?;
     tracing::info!("engine migration {} -> {} prepared", m.from, m.to);
@@ -72,12 +86,19 @@ pub enum Applied {
     Migrated { to: String },
     /// Migration failed; rolled back to the previous version, `to` blacklisted.
     RolledBack { to: String, error: String },
+    /// A prepared migration was too old to apply safely and was discarded.
+    Expired { to: String },
 }
 
 /// Apply a pending migration, if any. Called at daemon startup BEFORE the
 /// normal engine spawn. Migration failure is not an `Err`: the daemon must
 /// always come up, on the old version if need be.
 pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
+    let db = paths::meili_db_dir()?;
+    if recover_stranded_backup(&db)? {
+        tracing::info!("stranded backup recovered before migration check");
+    }
+
     let marker_path = paths::engine_migration_file()?;
     let Some(m) = Migration::load_from(&marker_path) else {
         return Ok(Applied::None);
@@ -86,8 +107,17 @@ pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
     // loop the daemon into repeated migration attempts.
     let _ = std::fs::remove_file(&marker_path);
 
+    if m.prepared_at == 0 || now_secs() - m.prepared_at > MAX_MARKER_AGE_SECS {
+        tracing::warn!(
+            "discarding stale engine migration to {} (prepared {}s ago); the next daily check will re-prepare it",
+            m.to,
+            if m.prepared_at == 0 { -1 } else { now_secs() - m.prepared_at }
+        );
+        let _ = std::fs::remove_file(&m.dump_path);
+        return Ok(Applied::Expired { to: m.to });
+    }
+
     tracing::info!("applying engine migration {} -> {}", m.from, m.to);
-    let db = paths::meili_db_dir()?;
     let backup = db.with_file_name(format!("meili-data.bak.{}", now_secs()));
     if db.exists() {
         std::fs::rename(&db, &backup)
@@ -99,13 +129,19 @@ pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
             cfg.meilisearch.version = m.to.clone();
             cfg.save()?;
             prune_backups(&db)?;
+            let _ = std::fs::remove_file(&m.dump_path);
             tracing::info!("engine migrated to {}", m.to);
             Ok(Applied::Migrated { to: m.to })
         }
         Err(e) => {
             let error = format!("{e:#}");
             tracing::error!("engine migration to {} failed: {error}", m.to);
-            restore_backup(&db, &backup)?;
+            if let Err(restore_err) = restore_backup(&db, &backup) {
+                tracing::error!(
+                    "CRITICAL: rollback restore failed — your memories are intact at {}: {restore_err:#}",
+                    backup.display()
+                );
+            }
             let state_path = paths::update_state_file()?;
             let mut state = UpdateState::load_from(&state_path);
             state.record_engine_failure(&m.to);
@@ -114,6 +150,41 @@ pub async fn apply_pending(cfg: &mut Config) -> Result<Applied> {
             Ok(Applied::RolledBack { to: m.to, error })
         }
     }
+}
+
+/// Self-heal after a crash mid-migration: if the db dir is gone but a backup
+/// exists (the rename happened, the import never finished), put the newest
+/// backup back. Returns true when a recovery happened.
+pub fn recover_stranded_backup(db: &Path) -> Result<bool> {
+    if db.exists() {
+        return Ok(false);
+    }
+    let Some(parent) = db.parent() else {
+        return Ok(false);
+    };
+    let prefix = "meili-data.bak.";
+    let mut backups: Vec<PathBuf> = std::fs::read_dir(parent)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(prefix))
+        })
+        .collect();
+    backups.sort();
+    let Some(newest) = backups.pop() else {
+        return Ok(false);
+    };
+    std::fs::rename(&newest, db)
+        .with_context(|| format!("restoring stranded backup {}", newest.display()))?;
+    tracing::warn!(
+        "recovered database from stranded backup {} (crash during a previous migration?)",
+        newest.display()
+    );
+    Ok(true)
 }
 
 /// Boot the new engine with `--import-dump` on the (empty) db dir, wait for
@@ -148,6 +219,9 @@ async fn import_and_verify(cfg: &Config, m: &Migration) -> Result<()> {
         let want = m.to.trim_start_matches('v');
         if v != want {
             bail!("engine reports version {v}, expected {want}");
+        }
+        if m.expected_docs == 0 {
+            tracing::warn!("no baseline document count — verification limited to version + health");
         }
         let docs = client
             .stats()
@@ -201,10 +275,13 @@ pub fn prune_backups(db_dir: &Path) -> Result<()> {
     // is chronological.
     backups.sort();
     for old in backups.iter().rev().skip(1) {
-        if old.is_dir() {
-            let _ = std::fs::remove_dir_all(old);
+        let result = if old.is_dir() {
+            std::fs::remove_dir_all(old)
         } else {
-            let _ = std::fs::remove_file(old);
+            std::fs::remove_file(old)
+        };
+        if let Err(e) = result {
+            tracing::warn!("could not prune old backup {}: {e}", old.display());
         }
     }
     Ok(())
@@ -223,12 +300,23 @@ mod tests {
             to: "v1.46.0".into(),
             dump_path: dir.path().join("dumps/abc.dump"),
             expected_docs: 123,
+            prepared_at: 1234,
         };
         m.save_to(&path).unwrap();
         let loaded = Migration::load_from(&path).unwrap();
         assert_eq!(loaded.to, "v1.46.0");
         assert_eq!(loaded.expected_docs, 123);
+        assert_eq!(loaded.prepared_at, 1234);
         assert!(Migration::load_from(&dir.path().join("missing.json")).is_none());
+        // A marker missing `prepared_at` (older build) must still deserialise.
+        assert_eq!(
+            serde_json::from_str::<Migration>(
+                r#"{"from":"a","to":"b","dump_path":"/x","expected_docs":1}"#
+            )
+            .unwrap()
+            .prepared_at,
+            0
+        );
     }
 
     #[test]
@@ -269,5 +357,21 @@ mod tests {
         assert!(!dir.path().join("meili-data.bak.100").exists());
         assert!(!dir.path().join("meili-data.bak.200").exists());
         assert!(dir.path().join("meili-data.bak.300").exists());
+    }
+
+    #[test]
+    fn recover_stranded_backup_restores_newest() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("meili-data");
+        for ts in [100, 200] {
+            let b = dir.path().join(format!("meili-data.bak.{ts}"));
+            std::fs::create_dir_all(&b).unwrap();
+            std::fs::write(b.join("VERSION"), ts.to_string()).unwrap();
+        }
+        assert!(recover_stranded_backup(&db).unwrap());
+        assert_eq!(std::fs::read_to_string(db.join("VERSION")).unwrap(), "200");
+        assert!(dir.path().join("meili-data.bak.100").exists(), "older backup untouched");
+        // With the db present, recovery is a no-op.
+        assert!(!recover_stranded_backup(&db).unwrap());
     }
 }
