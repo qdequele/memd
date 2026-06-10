@@ -68,3 +68,26 @@ pub fn pid_file() -> Result<PathBuf> {
 pub fn state_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("state.json"))
 }
+
+/// Persisted auto-update state (last check, failed engine versions).
+pub fn update_state_file() -> Result<PathBuf> {
+    Ok(data_dir()?.join("update-state.json"))
+}
+
+/// Marker describing a prepared engine migration, applied at daemon startup.
+pub fn engine_migration_file() -> Result<PathBuf> {
+    Ok(data_dir()?.join("engine-migration.json"))
+}
+
+/// Lock taken while an update is being applied (daemon or `memd update`).
+pub fn update_lock_file() -> Result<PathBuf> {
+    Ok(data_dir()?.join("update.lock"))
+}
+
+/// Directory where the managed Meilisearch writes dumps (created on demand).
+pub fn dumps_dir() -> Result<PathBuf> {
+    let dir = data_dir()?.join("dumps");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating dumps dir {}", dir.display()))?;
+    Ok(dir)
+}

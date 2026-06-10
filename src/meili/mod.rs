@@ -110,9 +110,8 @@ pub async fn spawn(cfg: &Config) -> Result<Child> {
     // (read-only on macOS → EROFS), so pin them to absolute paths inside our
     // data dir. This keeps the daemon working no matter how it is launched.
     let data = paths::data_dir()?;
-    let dumps = data.join("dumps");
+    let dumps = paths::dumps_dir()?;
     let snapshots = data.join("snapshots");
-    std::fs::create_dir_all(&dumps)?;
     std::fs::create_dir_all(&snapshots)?;
 
     let addr = format!("{}:{}", cfg.meilisearch.host, cfg.meilisearch.port);
