@@ -8,6 +8,14 @@ on:
       tag:
         description: "Tag to build/publish (e.g. v0.1.0)"
         required: true
+  # Called by release-please.yml after it cuts a release — tags created with
+  # GITHUB_TOKEN do not fire the `push: tags` trigger above.
+  workflow_call:
+    inputs:
+      tag:
+        description: "Tag to build/publish (e.g. v0.1.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -36,6 +44,9 @@ jobs:
             target: aarch64-unknown-linux-gnu
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Build the tagged commit, not whatever branch triggered us.
+          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -50,6 +61,7 @@ jobs:
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: memd-${{ matrix.target }}
-          generate_release_notes: true
+          # Release notes are owned by release-please (CHANGELOG-based);
+          # regenerating them here would clobber that body.

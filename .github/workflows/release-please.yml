@@ -1,0 +1,39 @@
+name: Release Please
+
+# On every merge to main, release-please maintains a release PR that
+# accumulates a CHANGELOG from conventional commits and bumps the version in
+# Cargo.toml. Merging that PR tags the release and publishes it with those
+# notes; the build job below then attaches the platform binaries.
+#
+# The binaries are built via workflow_call (not the tag-push trigger in
+# release.yml) because refs created with the workflow's GITHUB_TOKEN do not
+# fire other workflows.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          release-type: rust
+
+  build-binaries:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.release-please.outputs.tag_name }}
