@@ -13,6 +13,7 @@ mod mcp;
 mod meili;
 mod memory;
 mod paths;
+mod update;
 
 use clap::{Parser, Subcommand};
 
