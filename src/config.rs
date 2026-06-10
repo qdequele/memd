@@ -27,6 +27,7 @@ pub struct Config {
     pub mcp: McpConfig,
     pub embedder: EmbedderConfig,
     pub crawler: CrawlerConfig,
+    pub update: UpdateConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +76,13 @@ pub struct CrawlerConfig {
     pub deny_globs: Vec<String>,
     /// Periodic reconcile interval, in seconds.
     pub reconcile_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Automatically apply memd + engine updates found by the daily check.
+    pub auto: bool,
 }
 
 impl Default for MeiliConfig {
@@ -147,6 +155,12 @@ impl Default for CrawlerConfig {
     }
 }
 
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self { auto: true }
+    }
+}
+
 impl Config {
     /// Load config from disk, creating it with defaults (and a freshly
     /// generated master key) if it does not yet exist.
@@ -208,4 +222,20 @@ fn generate_key() -> String {
     let a = uuid::Uuid::new_v4().simple().to_string();
     let b = uuid::Uuid::new_v4().simple().to_string();
     format!("{a}{b}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_auto_defaults_to_true() {
+        assert!(Config::default().update.auto);
+    }
+
+    #[test]
+    fn update_section_parses_from_toml() {
+        let cfg: Config = toml::from_str("[update]\nauto = false\n").unwrap();
+        assert!(!cfg.update.auto);
+    }
 }

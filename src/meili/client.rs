@@ -249,6 +249,28 @@ impl MeiliClient {
         self.get(&format!("/indexes/{INDEX}/stats")).await
     }
 
+    /// Trigger a dump of the whole instance and wait for it to finish.
+    /// Returns the dump uid; the file is `<uid>.dump` in the dump dir.
+    pub async fn create_dump(&self) -> Result<String> {
+        let resp = self
+            .http
+            .post(self.url("/dumps"))
+            .bearer_auth(&self.key)
+            .send()
+            .await?;
+        let v = Self::json_or_err(resp).await.context("creating dump")?;
+        let uid = v
+            .get("taskUid")
+            .and_then(|t| t.as_u64())
+            .context("dump response had no taskUid")?;
+        let task = self.wait_task(uid).await?;
+        task.get("details")
+            .and_then(|d| d.get("dumpUid"))
+            .and_then(|s| s.as_str())
+            .map(String::from)
+            .context("dump task did not report a dumpUid")
+    }
+
     /// Poll a task until it reaches a terminal state.
     pub async fn wait_task(&self, uid: u64) -> Result<Value> {
         for _ in 0..600 {

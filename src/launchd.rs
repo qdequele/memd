@@ -82,7 +82,10 @@ pub fn load() -> Result<()> {
     Ok(())
 }
 
-/// True if the LaunchAgent plist exists on disk.
+/// True if the LaunchAgent plist exists on disk. Note: this does not check
+/// whether launchd actually has the job loaded — a plist left behind while
+/// unloaded yields a false positive (callers treating this as "launchd will
+/// relaunch us" should keep that in mind).
 pub fn is_installed() -> bool {
     plist_path().map(|p| p.exists()).unwrap_or(false)
 }

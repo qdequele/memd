@@ -113,6 +113,17 @@ pub async fn status() -> Result<()> {
         }
     );
 
+    let upd = crate::update::UpdateState::load();
+    if upd.last_check_secs > 0 {
+        println!(
+            "Updates:      last check {} — {}",
+            format_ts(upd.last_check_secs),
+            upd.last_result
+        );
+    } else {
+        println!("Updates:      never checked (daily check runs in the daemon)");
+    }
+
     match crawler::last_summary() {
         Some(s) => println!(
             "Last crawl:   {} indexed, {} skipped, {} deleted, {} errors (at {})",
@@ -635,6 +646,17 @@ fn health_label(up: bool) -> &'static str {
     if up { "up" } else { "down" }
 }
 
+/// Format unix seconds as RFC3339 for human output.
+fn format_ts(secs: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(secs)
+        .ok()
+        .and_then(|t| {
+            t.format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .unwrap_or_else(|| secs.to_string())
+}
+
 /// Spawn `memd serve` as a detached background process (non-macOS path).
 fn spawn_detached() -> Result<()> {
     let exe = std::env::current_exe()?;
@@ -979,7 +1001,10 @@ async fn fix_db_mismatch() -> Result<()> {
     }
     let db = paths::meili_db_dir()?;
     if db.exists() {
-        let backup = db.with_file_name(format!("meili-data.bak.{}", now_secs()));
+        // Distinct prefix: `meili-data.bak.*` is reserved for migration backups,
+        // which the updater auto-restores when the db dir is missing — this one
+        // must stay stranded (it is version-incompatible by definition).
+        let backup = db.with_file_name(format!("meili-data.mismatch.{}", now_secs()));
         std::fs::rename(&db, &backup).with_context(|| format!("backing up {}", db.display()))?;
         println!("  backed up old database -> {}", backup.display());
     }
@@ -1022,4 +1047,110 @@ unsafe fn libc_kill(pid: i32, sig: i32) {
     unsafe {
         kill(pid, sig);
     }
+}
+
+/// Check for updates; apply them unless `check_only`. Manual counterpart of
+/// the daemon's daily check — takes the same lock so the two never race.
+pub async fn update(check_only: bool) -> Result<()> {
+    let cfg = Config::load_or_init()?;
+    let state_path = paths::update_state_file()?;
+    let mut state = crate::update::UpdateState::load_from(&state_path);
+
+    println!(
+        "memd {} (engine pinned {}) — checking GitHub…",
+        env!("CARGO_PKG_VERSION"),
+        cfg.meilisearch.version
+    );
+    let memd_res = crate::update::check::latest_release(crate::update::check::MEMD_REPO).await;
+    let engine_res = crate::update::check::latest_release(crate::update::check::ENGINE_REPO).await;
+    if let Err(e) = &memd_res {
+        eprintln!("warning: could not check memd releases: {e:#}");
+    }
+    if let Err(e) = &engine_res {
+        eprintln!("warning: could not check Meilisearch releases: {e:#}");
+    }
+    if memd_res.is_err() && engine_res.is_err() {
+        bail!("GitHub is unreachable — try again later");
+    }
+    let memd_rel = memd_res.ok();
+    let engine_rel = engine_res.ok();
+    let asset = crate::update::check::memd_asset_name()?;
+    let plan = crate::update::check::decide(
+        memd_rel.as_ref(),
+        engine_rel.as_ref(),
+        env!("CARGO_PKG_VERSION"),
+        &cfg.meilisearch.version,
+        &state,
+        asset,
+    );
+
+    match plan {
+        crate::update::check::Plan::None => {
+            println!("Everything is up to date.");
+            return Ok(());
+        }
+        crate::update::check::Plan::Memd { version, asset_url } => {
+            if check_only {
+                println!("memd {version} is available (run `memd update` to apply).");
+                return Ok(());
+            }
+            let _lock = crate::update::UpdateLock::acquire()?;
+            let installed = paths::installed_bin()?;
+            crate::update::self_update::apply(&asset_url, &version, &installed).await?;
+            println!("memd updated to {version} at {}", installed.display());
+            state.last_result = format!("memd updated to {version}");
+            state.last_check_secs = now_secs();
+            state.save_to(&state_path)?;
+            restart_service(&cfg).await?;
+            println!("Run `memd update` again to check for engine updates.");
+        }
+        crate::update::check::Plan::Engine { version } => {
+            if check_only {
+                println!(
+                    "Meilisearch engine {version} is available (pinned {}).",
+                    cfg.meilisearch.version
+                );
+                return Ok(());
+            }
+            let svc = MemoryService::from_config(&cfg);
+            if !svc.client().is_healthy().await {
+                bail!("the Meilisearch engine must be running to migrate — run `memd up` first");
+            }
+            let _lock = crate::update::UpdateLock::acquire()?;
+            crate::update::engine::prepare(&cfg, svc.client(), &version).await?;
+            state.last_result = format!("engine migration to {version} prepared");
+            state.last_check_secs = now_secs();
+            state.save_to(&state_path)?;
+            println!("Engine migration to {version} prepared; restarting the daemon to apply…");
+            restart_service(&cfg).await?;
+            println!("Check `memd status` — the import may take a moment on large stores.");
+        }
+    }
+    Ok(())
+}
+
+/// Restart the daemon so a swapped binary / prepared migration takes effect,
+/// then poll until it reports healthy again (engine imports can take longer —
+/// we report, not fail, on timeout).
+async fn restart_service(cfg: &Config) -> Result<()> {
+    if launchd::is_installed() {
+        launchd::unload()?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        launchd::load()?;
+        for _ in 0..40 {
+            if daemon_healthy(cfg).await {
+                println!("Service restarted.");
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        println!(
+            "Service reloaded but not healthy yet (an engine import can take a while) — check `memd status` / `memd logs`."
+        );
+    } else {
+        println!(
+            "No launchd service installed — restart the daemon manually (`memd down && memd up`). A prepared engine migration expires after 1 hour."
+        );
+    }
+    Ok(())
 }

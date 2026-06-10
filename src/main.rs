@@ -13,6 +13,7 @@ mod mcp;
 mod meili;
 mod memory;
 mod paths;
+mod update;
 
 use clap::{Parser, Subcommand};
 
@@ -138,6 +139,12 @@ enum Command {
         #[arg(long)]
         fix: bool,
     },
+    /// Check GitHub for updates to memd and the managed engine; apply them.
+    Update {
+        /// Only report what would be updated.
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -222,5 +229,6 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Setup { no_hooks } => cli::setup(no_hooks).await,
         Command::Doctor { fix } => cli::doctor(fix).await,
+        Command::Update { check } => cli::update(check).await,
     }
 }

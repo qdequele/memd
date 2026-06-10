@@ -44,6 +44,18 @@ the type is inferred heuristically.
 | `memd crawl status` | Show the last crawl summary. |
 | `memd crawl config` | Print the active crawl configuration. |
 
+## Updates
+
+| Command | Description |
+|---------|-------------|
+| `memd update` | Check GitHub and apply any memd / engine update now. |
+| `memd update --check` | Report available updates without applying them. |
+
+The daemon also checks once a day on its own and applies updates
+automatically (disable with `[update] auto = false` in the config). Engine
+upgrades use Meilisearch's dump → import flow and roll back automatically if
+the migration fails — memories are never lost.
+
 ## MCP & service
 
 | Command | Description |
