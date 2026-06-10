@@ -109,6 +109,99 @@ impl Drop for UpdateLock {
     }
 }
 
+pub const CHECK_INTERVAL_SECS: i64 = 24 * 3600;
+
+/// Daemon background task: daily check, applying at most one update per
+/// check. When an update was applied/prepared, sends a restart request and
+/// returns — the daemon is about to go down.
+pub async fn run_loop(
+    cfg: crate::config::Config,
+    restart_tx: tokio::sync::mpsc::Sender<&'static str>,
+) {
+    if !cfg.update.auto {
+        tracing::info!("auto-update disabled in config ([update] auto = false)");
+        return;
+    }
+    // Jittered initial delay: let the engine settle and de-synchronize checks
+    // across machines (pid as a cheap entropy source — no rand dependency).
+    let initial = std::time::Duration::from_secs(120 + (std::process::id() as u64 % 180));
+    tokio::time::sleep(initial).await;
+
+    loop {
+        let Ok(state_path) = paths::update_state_file() else {
+            return;
+        };
+        let mut state = UpdateState::load_from(&state_path);
+        let now = crate::memory::model::now_secs();
+        if now - state.last_check_secs >= CHECK_INTERVAL_SECS {
+            match tick(&cfg, &mut state).await {
+                Ok(Some(reason)) => {
+                    // Deliberately NOT bumping last_check_secs: the restarted
+                    // daemon re-checks promptly and picks up any further
+                    // update (e.g. engine after a memd self-update).
+                    let _ = state.save_to(&state_path);
+                    let _ = restart_tx.send(reason).await;
+                    return;
+                }
+                Ok(None) => {
+                    state.last_check_secs = now;
+                    let _ = state.save_to(&state_path);
+                }
+                Err(e) => {
+                    tracing::warn!("update check failed: {e:#}");
+                    state.last_check_secs = now;
+                    state.last_result = format!("check failed: {e:#}");
+                    let _ = state.save_to(&state_path);
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
+}
+
+/// One check: decide and apply at most one update. Returns `Some(reason)`
+/// when the daemon must restart to finish the job.
+async fn tick(
+    cfg: &crate::config::Config,
+    state: &mut UpdateState,
+) -> Result<Option<&'static str>> {
+    let _lock = UpdateLock::acquire()?;
+    let memd_rel = check::latest_release(check::MEMD_REPO).await.ok();
+    let engine_rel = check::latest_release(check::ENGINE_REPO).await.ok();
+    let asset = check::memd_asset_name()?;
+    let plan = check::decide(
+        memd_rel.as_ref(),
+        engine_rel.as_ref(),
+        env!("CARGO_PKG_VERSION"),
+        &cfg.meilisearch.version,
+        state,
+        asset,
+    );
+    match plan {
+        check::Plan::None => {
+            state.last_result = "up to date".into();
+            Ok(None)
+        }
+        check::Plan::Memd { version, asset_url } => {
+            tracing::info!("memd update available: {version}");
+            let installed = paths::installed_bin()?;
+            self_update::apply(&asset_url, &version, &installed).await?;
+            state.last_result = format!("memd updated to {version}");
+            Ok(Some("memd self-update"))
+        }
+        check::Plan::Engine { version } => {
+            tracing::info!("engine update available: {version}");
+            let client = crate::meili::MeiliClient::new(
+                cfg.meili_url(),
+                cfg.meilisearch.master_key.clone(),
+            );
+            engine::prepare(cfg, &client, &version).await?;
+            state.last_result = format!("engine migration to {version} prepared");
+            Ok(Some("engine migration"))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
