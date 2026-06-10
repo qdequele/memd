@@ -72,9 +72,11 @@ impl UpdateLock {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 let stale = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
-                    .map(|t| t.elapsed().map(|d| d.as_secs() > 3600).unwrap_or(false))
+                    .map(|t| t.elapsed().map(|d| d.as_secs() > 3600).unwrap_or(true))
                     .unwrap_or(true);
                 if stale {
+                    // Tiny remove→create race window is acceptable: at most one
+                    // daemon and one interactive `memd update` contend here.
                     let _ = std::fs::remove_file(&path);
                     Self::try_create(&path)
                         .with_context(|| format!("reclaiming stale lock {}", path.display()))
@@ -111,9 +113,11 @@ mod tests {
     fn state_round_trips() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("update-state.json");
-        let mut s = UpdateState::default();
-        s.last_check_secs = 42;
-        s.last_result = "ok".into();
+        let mut s = UpdateState {
+            last_check_secs: 42,
+            last_result: "ok".into(),
+            ..Default::default()
+        };
         s.record_engine_failure("v1.46.0");
         s.save_to(&path).unwrap();
         let loaded = UpdateState::load_from(&path);
