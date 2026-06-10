@@ -70,7 +70,9 @@ pub async fn latest_release(repo: &str) -> Result<Release> {
         .await
         .with_context(|| format!("requesting {url}"))?;
     if !resp.status().is_success() {
-        bail!("GitHub API error {} for {url}", resp.status());
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("GitHub API error {status} for {url}: {body}");
     }
     resp.json::<Release>()
         .await
@@ -237,6 +239,25 @@ mod tests {
     #[test]
     fn decide_handles_missing_releases() {
         let plan = decide(None, None, "0.1.0", "v1.45.1", &UpdateState::default(), "x");
+        assert_eq!(plan, Plan::None);
+    }
+
+    #[test]
+    fn decide_skips_draft_releases() {
+        let memd_draft = Release {
+            tag_name: "v0.2.0".into(),
+            draft: true,
+            prerelease: false,
+            assets: vec![asset("memd-test")],
+        };
+        let plan = decide(
+            Some(&memd_draft),
+            None,
+            "0.1.0",
+            "v1.45.1",
+            &UpdateState::default(),
+            "memd-test",
+        );
         assert_eq!(plan, Plan::None);
     }
 }
