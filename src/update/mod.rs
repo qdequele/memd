@@ -2,6 +2,8 @@
 //! managed Meilisearch engine.
 //! Spec: docs/superpowers/specs/2026-06-10-auto-update-design.md
 
+pub mod check;
+
 use crate::paths;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
