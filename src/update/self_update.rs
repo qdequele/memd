@@ -15,21 +15,44 @@ pub async fn apply(url: &str, expected_version: &str, installed: &Path) -> Resul
         std::fs::create_dir_all(parent)?;
     }
     let tmp = installed.with_extension("new");
-    download(url, &tmp).await?;
+    let result = download_and_swap(url, expected_version, &tmp, installed).await;
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// The fallible middle of [`apply`]: download, chmod, verify, swap.
+async fn download_and_swap(
+    url: &str,
+    expected_version: &str,
+    tmp: &Path,
+    installed: &Path,
+) -> Result<()> {
+    download(url, tmp).await?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&tmp)?.permissions();
+        let mut perms = std::fs::metadata(tmp)?.permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&tmp, perms)?;
+        std::fs::set_permissions(tmp, perms)?;
     }
-    verify_and_swap(&tmp, installed, expected_version)
+    // `--version` runs a subprocess: do it off the async runtime.
+    let tmp_owned = tmp.to_path_buf();
+    let installed_owned = installed.to_path_buf();
+    let expected = expected_version.to_string();
+    tokio::task::spawn_blocking(move || {
+        verify_and_swap(&tmp_owned, &installed_owned, &expected)
+    })
+    .await
+    .context("verify task panicked")?
 }
 
 /// Stream `url` to `dest`.
 async fn download(url: &str, dest: &Path) -> Result<()> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
+        .https_only(true)
         .build()?;
     let resp = client
         .get(url)
@@ -64,19 +87,45 @@ fn verify_and_swap(tmp: &Path, installed: &Path, expected_version: &str) -> Resu
         .with_context(|| format!("swapping {} into place", installed.display()))
 }
 
-/// Run `<bin> --version` and check the output mentions `expected_version`.
-/// Catches corrupt or wrong-architecture downloads before anything is touched.
+/// Run `<bin> --version` (10s timeout) and check the output mentions
+/// `expected_version`. Catches corrupt or wrong-architecture downloads before
+/// anything is touched.
 fn verify_version(bin: &Path, expected_version: &str) -> Result<()> {
-    let out = std::process::Command::new(bin)
+    verify_version_with_timeout(bin, expected_version, Duration::from_secs(10))
+}
+
+/// Inner implementation of version verification with a configurable timeout.
+fn verify_version_with_timeout(bin: &Path, expected_version: &str, timeout: Duration) -> Result<()> {
+    use std::process::Stdio;
+    let mut child = std::process::Command::new(bin)
         .arg("--version")
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
         .with_context(|| format!("running {} --version", bin.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let deadline = std::time::Instant::now() + timeout;
+    // Reading stdout after exit is safe here: --version output is far below
+    // the pipe buffer size, so the child never blocks on a full pipe.
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() > deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("downloaded binary hung in --version ({timeout:?} timeout)");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
+    let mut stdout = String::new();
+    if let Some(mut out) = child.stdout.take() {
+        use std::io::Read;
+        let _ = out.read_to_string(&mut stdout);
+    }
     let expected = expected_version.trim_start_matches('v');
-    if !out.status.success() || !stdout.contains(expected) {
+    if !status.success() || !stdout.contains(expected) {
         bail!(
-            "downloaded binary failed verification (status {:?}, output {:?}, expected version {expected})",
-            out.status,
+            "downloaded binary failed verification (status {status:?}, output {:?}, expected version {expected})",
             stdout.trim()
         );
     }
@@ -133,5 +182,17 @@ mod tests {
         assert!(!tmp.exists());
         let kept = std::fs::read_to_string(&installed).unwrap();
         assert!(kept.contains("0.1.0"));
+    }
+
+    #[test]
+    fn verify_times_out_on_hung_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("memd.new");
+        std::fs::write(&p, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut perms = std::fs::metadata(&p).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&p, perms).unwrap();
+        let err = verify_version_with_timeout(&p, "v0.2.0", Duration::from_millis(200)).unwrap_err();
+        assert!(err.to_string().contains("timeout"), "got: {err}");
     }
 }
