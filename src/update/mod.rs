@@ -3,6 +3,7 @@
 //! Spec: docs/superpowers/specs/2026-06-10-auto-update-design.md
 
 pub mod check;
+pub mod engine;
 pub mod self_update;
 
 use crate::paths;
