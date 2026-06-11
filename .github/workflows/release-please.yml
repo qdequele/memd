@@ -2,8 +2,10 @@ name: Release Please
 
 # On every merge to main, release-please maintains a release PR that
 # accumulates a CHANGELOG from conventional commits and bumps the version in
-# Cargo.toml. Merging that PR tags the release and publishes it with those
-# notes; the build job below then attaches the platform binaries.
+# Cargo.toml. Merging that PR tags and publishes the release; the jobs below
+# then attach the platform binaries and rewrite the release body with
+# PR-based notes (one line per merged PR — the "why" lives in PRs, while the
+# commit-level "what" stays in CHANGELOG.md).
 #
 # The binaries are built via workflow_call (not the tag-push trigger in
 # release.yml) because refs created with the workflow's GITHUB_TOKEN do not
@@ -37,3 +39,23 @@ jobs:
     uses: ./.github/workflows/release.yml
     with:
       tag: ${{ needs.release-please.outputs.tag_name }}
+
+  pr-based-notes:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Replace release body with PR-based notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+        # generate-notes lists merged PRs (titles, links, authors) between the
+        # previous release and this tag — the "why" — instead of the raw
+        # commit list release-please writes. CHANGELOG.md keeps the
+        # commit-level detail in the repo.
+        run: |
+          body=$(gh api -X POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" --jq .body)
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$body"
