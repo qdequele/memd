@@ -8,6 +8,7 @@ mod cli;
 mod config;
 mod crawler;
 mod daemon;
+mod history;
 mod launchd;
 mod mcp;
 mod meili;
@@ -89,6 +90,24 @@ enum Command {
     Forget {
         /// The memory id.
         id: String,
+    },
+    /// Show the history of memory changes (created, updated, deleted, crawled).
+    History {
+        /// Filter by action: create, update, delete, or crawl.
+        #[arg(long)]
+        action: Option<String>,
+        /// Filter by memory type.
+        #[arg(long, value_name = "TYPE")]
+        r#type: Option<String>,
+        /// Filter by scope.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Only events since this unix timestamp or relative span (e.g. 30d, 12h).
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of events.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
     },
     /// Manage passive ingestion (the crawler).
     Crawl {
@@ -199,6 +218,13 @@ async fn main() -> anyhow::Result<()> {
             limit,
         } => cli::search(query, r#type, since, semantic_ratio, limit).await,
         Command::Forget { id } => cli::forget(id).await,
+        Command::History {
+            action,
+            r#type,
+            scope,
+            since,
+            limit,
+        } => cli::history(action, r#type, scope, since, limit).await,
         Command::Crawl { action } => match action {
             CrawlAction::Run => cli::crawl_run().await,
             CrawlAction::Status => cli::crawl_status().await,

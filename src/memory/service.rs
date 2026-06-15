@@ -6,6 +6,7 @@
 use super::classify;
 use super::model::{MemoryItem, MemoryType, Source, now_secs};
 use crate::config::Config;
+use crate::history::{EventAction, EventLog, EventQuery, MemoryEvent};
 use crate::meili::MeiliClient;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -99,13 +100,16 @@ const META_FIELDS: &[&str] = &[
 #[derive(Clone)]
 pub struct MemoryService {
     client: MeiliClient,
+    events: EventLog,
     default_semantic_ratio: f32,
 }
 
 impl MemoryService {
     pub fn new(client: MeiliClient, default_semantic_ratio: f32) -> Self {
+        let events = EventLog::from_client(&client);
         Self {
             client,
+            events,
             default_semantic_ratio,
         }
     }
@@ -118,6 +122,45 @@ impl MemoryService {
 
     pub fn client(&self) -> &MeiliClient {
         &self.client
+    }
+
+    /// The audit log of memory mutations.
+    pub fn events(&self) -> &EventLog {
+        &self.events
+    }
+
+    /// Query the mutation history (newest first).
+    pub async fn history(&self, q: &EventQuery) -> Result<Vec<Value>> {
+        self.events.query(q).await
+    }
+
+    /// Record a create/update/delete event, best-effort. Crawler-sourced
+    /// mutations are skipped here — they are summarized once per crawl pass.
+    #[allow(clippy::too_many_arguments)]
+    async fn record_mutation(
+        &self,
+        action: EventAction,
+        memory_id: &str,
+        title: Option<String>,
+        ty: Option<String>,
+        scope: Option<String>,
+        source: Source,
+        source_client: Option<String>,
+    ) {
+        if source == Source::Crawler {
+            return;
+        }
+        self.events
+            .record(MemoryEvent::mutation(
+                action,
+                memory_id,
+                title,
+                ty,
+                scope,
+                source,
+                source_client,
+            ))
+            .await;
     }
 
     /// Persist a memory. Classifies the type if absent, dedups on content hash,
@@ -156,6 +199,16 @@ impl MemoryService {
             content_hash: hash,
         };
         self.client.upsert(&item).await?;
+        self.record_mutation(
+            EventAction::Create,
+            &id,
+            item.title.clone(),
+            Some(item.r#type.clone()),
+            Some(item.scope.clone()),
+            source,
+            item.source_client.clone(),
+        )
+        .await;
         Ok(id)
     }
 
@@ -270,12 +323,36 @@ impl MemoryService {
         }
     }
 
-    /// Delete a memory by id. Returns whether something was deleted.
-    pub async fn forget(&self, id: &str) -> Result<bool> {
-        self.client.delete_doc(id).await
+    /// Delete a memory by id. Returns whether something was deleted. Records a
+    /// `delete` event (with a metadata snapshot taken before deletion), unless
+    /// the deletion came from the crawler.
+    pub async fn forget(&self, id: &str, source: Source) -> Result<bool> {
+        // Snapshot metadata before deletion so the audit row stays readable.
+        let meta = self.client.get_doc(id).await.ok().flatten();
+        let deleted = self.client.delete_doc(id).await?;
+        if deleted {
+            let field = |k: &str| {
+                meta.as_ref()
+                    .and_then(|d| d.get(k))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            };
+            self.record_mutation(
+                EventAction::Delete,
+                id,
+                field("title"),
+                field("type"),
+                field("scope"),
+                source,
+                None,
+            )
+            .await;
+        }
+        Ok(deleted)
     }
 
     /// Update fields on an existing memory (partial). Returns false if absent.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update(
         &self,
         id: &str,
@@ -284,6 +361,7 @@ impl MemoryService {
         tags: Option<Vec<String>>,
         scope: Option<String>,
         ty: Option<MemoryType>,
+        source: Source,
     ) -> Result<bool> {
         let Some(mut doc) = self.client.get_doc(id).await? else {
             return Ok(false);
@@ -306,6 +384,17 @@ impl MemoryService {
         }
         doc["updated_at"] = json!(now_secs());
         self.client.upsert(&doc).await?;
+        let field = |k: &str| doc.get(k).and_then(|v| v.as_str()).map(String::from);
+        self.record_mutation(
+            EventAction::Update,
+            id,
+            field("title"),
+            field("type"),
+            field("scope"),
+            source,
+            None,
+        )
+        .await;
         Ok(true)
     }
 

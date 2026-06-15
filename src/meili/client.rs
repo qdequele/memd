@@ -15,6 +15,9 @@ pub struct MeiliClient {
     http: reqwest::Client,
     base: String,
     key: String,
+    /// The index this client targets. Defaults to [`INDEX`]; use
+    /// [`MeiliClient::for_index`] to bind a clone to another index.
+    index: String,
 }
 
 impl MeiliClient {
@@ -27,6 +30,16 @@ impl MeiliClient {
             http,
             base: base.into(),
             key: key.into(),
+            index: INDEX.to_string(),
+        }
+    }
+
+    /// A clone of this client bound to a different index (shares the same HTTP
+    /// connection pool, base URL, and key).
+    pub fn for_index(&self, index: &str) -> Self {
+        Self {
+            index: index.to_string(),
+            ..self.clone()
         }
     }
 
@@ -123,15 +136,7 @@ impl MeiliClient {
             .patch("/experimental-features", &json!({ "vectorStore": true }))
             .await;
 
-        // Create the index (ignore "already exists").
-        let create = self
-            .post("/indexes", &json!({ "uid": INDEX, "primaryKey": "id" }))
-            .await;
-        if let Ok(v) = create
-            && let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64())
-        {
-            let _ = self.wait_task(uid).await; // tolerate "index already exists"
-        }
+        self.create_index().await;
 
         let settings = json!({
             "searchableAttributes": ["title", "content", "summary", "tags"],
@@ -148,8 +153,40 @@ impl MeiliClient {
                 }
             }
         });
+        self.apply_settings(&settings).await
+    }
+
+    /// Ensure the `memory_events` audit-log index exists with its settings. It
+    /// is a plain log — no embedder. Idempotent; safe on every daemon start.
+    pub async fn ensure_log_index(&self) -> Result<()> {
+        self.create_index().await;
+        let settings = json!({
+            "searchableAttributes": ["title", "detail", "memory_id"],
+            "filterableAttributes": ["action", "type", "scope", "source", "memory_id", "ts"],
+            "sortableAttributes": ["ts"],
+        });
+        self.apply_settings(&settings).await
+    }
+
+    /// Create `self.index` (ignoring "already exists").
+    async fn create_index(&self) {
+        let create = self
+            .post(
+                "/indexes",
+                &json!({ "uid": self.index, "primaryKey": "id" }),
+            )
+            .await;
+        if let Ok(v) = create
+            && let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64())
+        {
+            let _ = self.wait_task(uid).await; // tolerate "index already exists"
+        }
+    }
+
+    /// PATCH settings onto `self.index` and wait for the task.
+    async fn apply_settings(&self, settings: &Value) -> Result<()> {
         let v = self
-            .patch(&format!("/indexes/{INDEX}/settings"), &settings)
+            .patch(&format!("/indexes/{}/settings", self.index), settings)
             .await
             .context("applying index settings")?;
         if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
@@ -158,11 +195,20 @@ impl MeiliClient {
         Ok(())
     }
 
+    /// Insert documents without waiting for the indexing task to finish. Used
+    /// for the best-effort event log: eventual consistency is acceptable and
+    /// we must not add task-polling latency to every memory mutation.
+    pub async fn insert_no_wait<T: Serialize>(&self, docs: &[T]) -> Result<()> {
+        self.post(&format!("/indexes/{}/documents", self.index), &docs)
+            .await
+            .map(|_| ())
+    }
+
     /// Upsert one document and wait for the task to finish (so embeddings are
     /// computed before we return).
     pub async fn upsert<T: Serialize>(&self, doc: &T) -> Result<()> {
         let v = self
-            .post(&format!("/indexes/{INDEX}/documents"), &[doc])
+            .post(&format!("/indexes/{}/documents", self.index), &[doc])
             .await
             .context("adding document")?;
         if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
@@ -174,7 +220,7 @@ impl MeiliClient {
     /// Upsert many documents in a single task and wait for completion.
     pub async fn upsert_many<T: Serialize>(&self, docs: &[T]) -> Result<()> {
         let v = self
-            .post(&format!("/indexes/{INDEX}/documents"), &docs)
+            .post(&format!("/indexes/{}/documents", self.index), &docs)
             .await
             .context("adding documents")?;
         if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
@@ -186,7 +232,7 @@ impl MeiliClient {
     /// Delete one document by id and wait for completion.
     pub async fn delete_doc(&self, id: &str) -> Result<bool> {
         let v = self
-            .delete(&format!("/indexes/{INDEX}/documents/{id}"))
+            .delete(&format!("/indexes/{}/documents/{id}", self.index))
             .await?;
         if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
             let task = self.wait_task(uid).await?;
@@ -207,7 +253,10 @@ impl MeiliClient {
             return Ok(0);
         }
         let v = self
-            .post(&format!("/indexes/{INDEX}/documents/delete-batch"), &ids)
+            .post(
+                &format!("/indexes/{}/documents/delete-batch", self.index),
+                &ids,
+            )
             .await
             .context("batch deleting documents")?;
         if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
@@ -226,7 +275,7 @@ impl MeiliClient {
     pub async fn get_doc(&self, id: &str) -> Result<Option<Value>> {
         let resp = self
             .http
-            .get(self.url(&format!("/indexes/{INDEX}/documents/{id}")))
+            .get(self.url(&format!("/indexes/{}/documents/{id}", self.index)))
             .bearer_auth(&self.key)
             .send()
             .await?;
@@ -239,14 +288,14 @@ impl MeiliClient {
     /// Run a search. `hybrid` (embedder + semantic ratio) is included when
     /// `semantic_ratio` is `Some`.
     pub async fn search(&self, body: &Value) -> Result<Value> {
-        self.post(&format!("/indexes/{INDEX}/search"), body)
+        self.post(&format!("/indexes/{}/search", self.index), body)
             .await
             .context("searching index")
     }
 
     /// Index document/storage statistics.
     pub async fn stats(&self) -> Result<Value> {
-        self.get(&format!("/indexes/{INDEX}/stats")).await
+        self.get(&format!("/indexes/{}/stats", self.index)).await
     }
 
     /// Trigger a dump of the whole instance and wait for it to finish.

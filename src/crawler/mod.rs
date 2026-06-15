@@ -109,6 +109,19 @@ pub async fn scan(cfg: &Config, svc: &MemoryService) -> Result<CrawlSummary> {
     summary.deleted = reconcile_deletions(svc, &seen).await.unwrap_or(0);
     summary.finished_at = crate::memory::model::now_secs();
     save_summary(&summary)?;
+
+    // Record one rolled-up history event per crawl — but only when something
+    // actually changed, so periodic reconciles that find nothing don't flood
+    // the audit log.
+    if summary.indexed + summary.deleted + summary.errors > 0 {
+        let detail = format!(
+            "{} indexed, {} skipped, {} deleted, {} errors",
+            summary.indexed, summary.skipped, summary.deleted, summary.errors
+        );
+        svc.events()
+            .record(crate::history::MemoryEvent::crawl(detail))
+            .await;
+    }
     Ok(summary)
 }
 
@@ -139,7 +152,7 @@ pub async fn index_one(cfg: &Config, svc: &MemoryService, path: &Path) -> Result
 /// Remove the document for a deleted/removed file path.
 pub async fn remove_one(svc: &MemoryService, path: &Path) -> Result<bool> {
     let id = path_id(&path.to_string_lossy());
-    svc.forget(&id).await
+    svc.forget(&id, crate::memory::Source::Crawler).await
 }
 
 /// Watch configured roots and keep the index in sync. Runs until cancelled.

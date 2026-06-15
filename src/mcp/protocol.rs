@@ -5,6 +5,7 @@
 //! and the `notifications/initialized` no-op. Tool calls are translated into
 //! [`MemoryService`] operations.
 
+use crate::history::{EventAction, EventQuery};
 use crate::memory::{
     GetRequest, MemoryService, MemoryType, ProjectionOptions, QueryResult, SaveRequest, Source,
 };
@@ -161,6 +162,20 @@ fn tool_defs() -> Value {
                     "group_by": { "type": "array", "items": { "type": "string" }, "description": "Fields to group counts by (default: type, scope, source)." }
                 }
             }
+        },
+        {
+            "name": "history",
+            "description": "Audit timeline of memory changes (most recent first): which memories were created, updated, deleted, or crawled, when, and by which source. Metadata only — no old content. Optionally filter by action/type/scope/time.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "description": "create, update, delete, or crawl." },
+                    "type": { "type": "string", "description": "Filter by memory type." },
+                    "scope": { "type": "string", "description": "Filter by scope." },
+                    "since": { "type": "integer", "description": "Unix seconds lower bound on the event timestamp." },
+                    "limit": { "type": "integer", "description": "Max events (default 20)." }
+                }
+            }
         }
     ])
 }
@@ -177,6 +192,7 @@ async fn handle_tool_call(svc: &MemoryService, id: Value, params: Value) -> Valu
         "forget_memory" => forget_memory(svc, args).await,
         "list_memories" => list_memories(svc, args).await,
         "stats" => stats(svc, args).await,
+        "history" => history(svc, args).await,
         other => Err(anyhow::anyhow!("unknown tool: {other}")),
     };
 
@@ -268,6 +284,7 @@ async fn update_memory(svc: &MemoryService, args: Value) -> anyhow::Result<Value
             args.get("type")
                 .and_then(|t| t.as_str())
                 .and_then(MemoryType::parse),
+            Source::Mcp,
         )
         .await?;
     Ok(json!({ "updated": updated, "id": id }))
@@ -278,7 +295,7 @@ async fn forget_memory(svc: &MemoryService, args: Value) -> anyhow::Result<Value
         .get("id")
         .and_then(|i| i.as_str())
         .ok_or_else(|| anyhow::anyhow!("`id` is required"))?;
-    let deleted = svc.forget(id).await?;
+    let deleted = svc.forget(id, Source::Mcp).await?;
     Ok(json!({ "deleted": deleted, "id": id }))
 }
 
@@ -336,6 +353,25 @@ fn query_result_json(result: QueryResult) -> Value {
 async fn stats(svc: &MemoryService, args: Value) -> anyhow::Result<Value> {
     let group_by = str_array(&args, "group_by");
     svc.stats(&group_by).await
+}
+
+async fn history(svc: &MemoryService, args: Value) -> anyhow::Result<Value> {
+    let query = EventQuery {
+        action: args
+            .get("action")
+            .and_then(|a| a.as_str())
+            .and_then(EventAction::parse),
+        r#type: str_field(&args, "type"),
+        scope: str_field(&args, "scope"),
+        since: args.get("since").and_then(|s| s.as_i64()),
+        limit: args
+            .get("limit")
+            .and_then(|l| l.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(20),
+    };
+    let events = svc.history(&query).await?;
+    Ok(json!({ "count": events.len(), "events": events }))
 }
 
 // --- helpers ---------------------------------------------------------------
