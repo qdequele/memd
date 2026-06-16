@@ -62,8 +62,8 @@ git clone https://github.com/qdequele/memd && cd memd
 |------|--------------|
 | 📦 Binary | Copied to a stable path (`~/.local/bin/memd`) |
 | 🔍 Meilisearch | Pinned engine downloaded + started as a managed service (no Docker) |
-| 🔌 Agents | Auto-registered (`claude mcp add` for Claude Code, …) |
-| 📝 Directives | Usage block written into `CLAUDE.md` / `AGENTS.md` |
+| 🔌 Agents | Interactive picker — choose from detected agents (Claude Code, Codex, Gemini CLI, Cursor, Windsurf, Cline, Zed); selected ones get memd's MCP server registered |
+| 📝 Directives | Usage block written into agent instruction files (Claude Code, Codex, Gemini CLI) |
 | 🪝 Hooks | SessionStart (auto-recall) + Stop (auto-capture) wired into Claude Code |
 
 It's **idempotent** — re-run any time (e.g. after an upgrade) to reconverge.
@@ -102,8 +102,11 @@ once, by Meilisearch, on your first memory.
 
 ## 🔌 Using memd from your agents
 
-`memd setup` registers **Claude Code** automatically. Other clients connect to the
-same daemon two ways:
+`memd setup` shows an interactive checklist of the agents detected on your machine
+(Claude Code, Codex, Gemini CLI, Cursor, Windsurf, Cline, Zed) and wires the
+selected ones to its MCP server — un-checking a connected agent removes memd from
+it. Run `memd status` to see each agent's wiring state. Any other MCP-capable
+client can connect to the same daemon two ways:
 
 - **HTTP (always-on, preferred):** point the client at `http://127.0.0.1:7702/mcp`.
 - **stdio bridge:** `{ "command": "memd", "args": ["mcp", "--stdio"] }`
