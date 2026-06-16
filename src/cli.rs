@@ -95,6 +95,9 @@ pub async fn status() -> Result<()> {
                 .unwrap_or(0);
             println!("  memories:  {count}");
         }
+        if let Some(events) = svc.events().count().await {
+            println!("  events:    {events}");
+        }
     }
 
     let mcp_up = daemon_healthy(&cfg).await;
@@ -290,10 +293,50 @@ pub async fn search(
 pub async fn forget(id: String) -> Result<()> {
     let cfg = Config::load_or_init()?;
     let svc = require_daemon(&cfg).await?;
-    if svc.forget(&id).await? {
+    if svc.forget(&id, Source::Cli).await? {
         println!("Forgot memory {id}");
     } else {
         println!("No memory with id {id}");
+    }
+    Ok(())
+}
+
+/// Show the history of memory changes (most recent first).
+pub async fn history(
+    action: Option<String>,
+    ty: Option<String>,
+    scope: Option<String>,
+    since: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let cfg = Config::load_or_init()?;
+    let svc = require_daemon(&cfg).await?;
+
+    let parsed_action = match &action {
+        Some(s) => Some(crate::history::EventAction::parse(s).ok_or_else(|| {
+            anyhow::anyhow!("unknown action: {s} (use create/update/delete/crawl)")
+        })?),
+        None => None,
+    };
+    let since_ts = match since {
+        Some(s) => Some(parse_since(&s)?),
+        None => None,
+    };
+
+    let query = crate::history::EventQuery {
+        action: parsed_action,
+        r#type: ty,
+        scope,
+        since: since_ts,
+        limit,
+    };
+    let events = svc.history(&query).await?;
+    if events.is_empty() {
+        println!("No history yet.");
+        return Ok(());
+    }
+    for ev in &events {
+        println!("{}", crate::history::render_event(ev));
     }
     Ok(())
 }

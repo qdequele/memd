@@ -36,6 +36,24 @@ Memory types: `fact`, `preference`, `decision`, `task`, `project_overview`,
 `agent_instruction`, `file_annotation`, `code_note`, `reference`. When omitted,
 the type is inferred heuristically.
 
+## History
+
+An audit timeline of memory changes — what was created, updated, deleted, or
+crawled, when, and by which source (`cli`, `mcp`, or `crawler`). Metadata only:
+no old content is retained.
+
+```sh
+# Recent changes (newest first)
+memd history
+
+# Filter by action, type, scope, or time
+memd history --action delete --type fact --since 7d --limit 50
+```
+
+Each crawl pass logs a single rolled-up event (e.g. `12 indexed, 3 deleted`)
+rather than one event per file. The log starts empty on first run and accrues
+going forward — past mutations are not backfilled.
+
 ## Crawler
 
 | Command | Description |

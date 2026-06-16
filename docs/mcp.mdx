@@ -109,6 +109,7 @@ highlighting, and grouped counts happen server-side.
 | `forget_memory` | `id` | Delete a memory. |
 | `list_memories` | `type?`, `scope?`, `limit?`, `offset?`, `include_content?`, `crop_length?`, `facets?` | List recent memories — metadata-only by default. |
 | `stats` | `group_by?` | Document count + server-side facet counts (default: type/scope/source). |
+| `history` | `action?`, `type?`, `scope?`, `since?`, `limit?` | Audit timeline of memory changes (create/update/delete/crawl), newest first. Metadata only. |
 
 ## Protocol
 

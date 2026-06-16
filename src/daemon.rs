@@ -41,7 +41,11 @@ pub async fn serve() -> Result<()> {
         .ensure_index(&cfg.embedder.source, &cfg.embedder.model)
         .await
         .context("ensuring memories index")?;
-    tracing::info!("Meilisearch ready; index configured");
+    svc.events()
+        .ensure()
+        .await
+        .context("ensuring memory_events index")?;
+    tracing::info!("Meilisearch ready; indexes configured");
 
     // 3. Crawler + watcher in the background.
     let crawl_cfg = cfg.clone();
