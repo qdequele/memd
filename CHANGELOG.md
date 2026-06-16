@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.0](https://github.com/qdequele/memd/compare/v0.2.0...v0.3.0) (2026-06-16)
+
+
+### Features
+
+* agent auto-setup with interactive picker ([90cecff](https://github.com/qdequele/memd/commit/90cecff68ba072d52e843c31e4df2833f085ecf7))
+* **agents:** registry, detection, status, and MCP merge helpers ([bf49eef](https://github.com/qdequele/memd/commit/bf49eef3e63ab1343244947192438aa8c1671b3d))
+* **history:** audit timeline of memory changes ([722cad5](https://github.com/qdequele/memd/commit/722cad55cb28c4126e00624ea5cbd77de7f49872))
+* **history:** audit timeline of memory changes ([08cadff](https://github.com/qdequele/memd/commit/08cadffe538817c9b473a4e1ff8adda582c363f3))
+* **setup:** interactive agent picker with sync semantics ([cec834d](https://github.com/qdequele/memd/commit/cec834d3f0053632e34766d4392e03881da0227e))
+* **status:** report per-agent memd wiring state ([19c02e4](https://github.com/qdequele/memd/commit/19c02e42f1f904247541a26000c50458185e070e))
+
+
+### Bug Fixes
+
+* **agents:** never overwrite an unparseable agent config (data-loss guard) ([5c76069](https://github.com/qdequele/memd/commit/5c76069faca4291ca97d3e935bcb8edf84041d4e))
+* **setup:** drop duplicate post-setup message ([1ee4ba7](https://github.com/qdequele/memd/commit/1ee4ba72a9c5324765c1d98b3ee6d31ce4ee6dc4))
+
 ## [0.2.0](https://github.com/qdequele/memd/compare/v0.1.0...v0.2.0) (2026-06-11)
 
 
