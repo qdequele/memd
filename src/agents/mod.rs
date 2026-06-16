@@ -99,6 +99,8 @@ pub struct Agent {
 impl Agent {
     /// Human label for the MCP transport this agent uses.
     pub fn transport(&self) -> &'static str {
+        // Every supported agent registers over HTTP today; the per-variant
+        // arms are kept so transports can diverge later without restructuring.
         match self.mcp {
             McpKind::ClaudeCli => "HTTP",
             McpKind::Json { .. } => "HTTP",
@@ -197,6 +199,7 @@ fn cline_settings() -> PathBuf {
 /// The static registry of supported agents (paths resolved against $HOME).
 pub fn registry() -> Vec<Agent> {
     let h = home();
+    let cline = cline_settings();
     vec![
         Agent {
             id: "claude-code",
@@ -258,9 +261,9 @@ pub fn registry() -> Vec<Agent> {
         Agent {
             id: "cline",
             name: "Cline",
-            detect: DetectRule::FileExists(cline_settings()),
+            detect: DetectRule::FileExists(cline.clone()),
             mcp: McpKind::Json {
-                path: cline_settings(),
+                path: cline,
                 container: "mcpServers",
                 url_key: "url",
                 extra: &[("type", "streamableHttp")],

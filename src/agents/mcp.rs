@@ -300,4 +300,27 @@ mod tests {
         toml_merge_mcp(&p, "http://x/mcp", true).unwrap();
         assert!(toml_has_mcp(&p));
     }
+
+    #[test]
+    fn toml_remove_from_absent_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("missing.toml");
+        toml_merge_mcp(&p, "", false).unwrap();
+        assert!(!p.exists());
+    }
+
+    #[test]
+    fn toml_reinsert_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        toml_merge_mcp(&p, "http://x/mcp", true).unwrap();
+        toml_merge_mcp(&p, "http://y/mcp", true).unwrap();
+        let doc: toml::Value = toml::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        // Converges on the latest url; single entry.
+        assert_eq!(
+            doc["mcp_servers"]["memd"]["url"].as_str(),
+            Some("http://y/mcp")
+        );
+        assert_eq!(doc["mcp_servers"].as_table().unwrap().len(), 1);
+    }
 }
