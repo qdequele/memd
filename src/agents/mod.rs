@@ -1,10 +1,6 @@
 //! Per-agent integration: detect installed LLM agents, register memd's MCP
 //! server with them, write usage directives, and report wiring state. The
 //! registry is mostly data — `mcp.rs` carries the three write mechanisms.
-//!
-// The whole module is constructed but not yet called: `cli::setup`/`cli::status`
-// wire it up in Task 6/7. Until then everything here reads as dead code.
-#![allow(dead_code)]
 
 mod directives;
 mod hooks;
@@ -88,6 +84,8 @@ pub enum AgentStatus {
 /// A supported LLM agent: how to detect it, how to write its MCP entry, and
 /// which optional integrations (directives, hooks) it supports.
 pub struct Agent {
+    // stable identifier; referenced in tests/diagnostics
+    #[allow(dead_code)]
     pub id: &'static str,
     pub name: &'static str,
     pub detect: DetectRule,

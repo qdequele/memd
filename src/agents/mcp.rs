@@ -1,6 +1,9 @@
 //! The three ways memd registers/unregisters its MCP server with an agent:
 //! the Claude Code CLI, a merged JSON config, or a merged TOML config. All
-//! operations are idempotent and preserve unrelated keys.
+//! operations are idempotent and preserve unrelated keys. A successfully parsed
+//! config is round-tripped on write, so JSONC/TOML comments and formatting are
+//! not preserved; a file that fails to parse is left untouched (memd refuses to
+//! edit a config it can't parse rather than risk clobbering it).
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -20,10 +23,17 @@ pub fn json_merge_mcp(
     extra: &[(&str, &str)],
     present: bool,
 ) -> Result<()> {
-    let mut root: Value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let mut root: Value = if existing.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str(&existing).map_err(|_| {
+            anyhow::anyhow!(
+                "{} is not valid JSON — leaving it untouched (memd won't edit a file it can't parse)",
+                path.display()
+            )
+        })?
+    };
     if !root.is_object() {
         if !present {
             return Ok(());
@@ -241,6 +251,20 @@ mod tests {
         let p = dir.path().join("missing.json");
         json_merge_mcp(&p, "mcpServers", "", "url", &[], false).unwrap();
         assert!(!p.exists());
+    }
+
+    #[test]
+    fn json_does_not_clobber_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("settings.json");
+        // JSONC with a comment — serde_json can't parse this.
+        let original =
+            "{\n  // my settings\n  \"mcpServers\": { \"other\": { \"url\": \"http://o\" } }\n}\n";
+        std::fs::write(&p, original).unwrap();
+        let err = json_merge_mcp(&p, "mcpServers", "http://x/mcp", "url", &[], true);
+        assert!(err.is_err(), "should refuse to edit an unparseable file");
+        // File must be left byte-for-byte intact.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
     }
 
     #[test]
