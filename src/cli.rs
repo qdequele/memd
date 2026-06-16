@@ -574,12 +574,10 @@ fn configure_agents(installed: &Path, cfg: &Config, no_hooks: bool) -> Result<()
 
     for ((agent, status), want) in agents.iter().zip(&statuses).zip(&desired) {
         match crate::agents::plan_action(status, *want, interactive) {
-            crate::agents::Action::Configure => {
-                match agent.configure(installed, &url, !no_hooks) {
-                    Ok(_) => println!("✓ {}: configured ({})", agent.name, agent.transport()),
-                    Err(e) => println!("⚠ {}: {e}", agent.name),
-                }
-            }
+            crate::agents::Action::Configure => match agent.configure(installed, &url, !no_hooks) {
+                Ok(_) => println!("✓ {}: configured ({})", agent.name, agent.transport()),
+                Err(e) => println!("⚠ {}: {e}", agent.name),
+            },
             crate::agents::Action::Remove => match agent.remove() {
                 Ok(_) => println!("• {}: removed", agent.name),
                 Err(e) => println!("⚠ {}: {e}", agent.name),
