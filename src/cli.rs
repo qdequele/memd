@@ -9,7 +9,7 @@ use crate::memory::{
 };
 use crate::{crawler, launchd, meili, paths};
 use anyhow::{Context, Result, bail};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -501,26 +501,81 @@ pub async fn setup(no_hooks: bool) -> Result<()> {
         println!("⚠ daemon did not become healthy yet — check `memd logs`");
     }
 
-    // 5. Register with detected MCP clients.
-    register_claude_code(&installed);
-
-    // 6. Cross-tool instruction directives.
-    directives_install()?;
-
-    // 7. Claude Code lifecycle hooks (deterministic recall + capture).
-    if no_hooks {
-        println!("• skipped hooks (--no-hooks)");
-    } else {
-        match install_claude_hooks(&installed) {
-            Ok(true) => println!("✓ Claude Code hooks added (SessionStart + Stop)"),
-            Ok(false) => println!("✓ Claude Code hooks already present"),
-            Err(e) => println!("⚠ could not write hooks: {e}"),
-        }
-    }
+    // 5–7. Pick agents and converge their memd wiring (MCP + directives + hooks).
+    configure_agents(&installed, &cfg, no_hooks)?;
 
     println!(
         "\nmemd is set up. Open a new agent session (or `/hooks` in Claude Code) to activate."
     );
+    Ok(())
+}
+
+/// Interactive agent selection + convergence. On a TTY, show a multi-select
+/// pre-checked with already-configured agents (sync semantics: unchecking a
+/// configured agent removes memd from it). Off a TTY, configure every detected
+/// agent and remove nothing.
+fn configure_agents(installed: &Path, cfg: &Config, no_hooks: bool) -> Result<()> {
+    use std::io::IsTerminal;
+
+    let agents = crate::agents::registry();
+    let statuses: Vec<_> = agents.iter().map(|a| a.status()).collect();
+    let url = crate::agents::mcp_url(cfg);
+    let interactive = std::io::stdin().is_terminal();
+
+    // Determine the desired selection (one bool per agent).
+    let desired: Vec<bool> = if interactive {
+        let items: Vec<String> = agents
+            .iter()
+            .zip(&statuses)
+            .map(|(a, s)| {
+                let tag = match s {
+                    crate::agents::AgentStatus::Configured => "configured",
+                    crate::agents::AgentStatus::Detected => "detected",
+                    crate::agents::AgentStatus::NotDetected => "not detected",
+                };
+                format!("{} ({tag})", a.name)
+            })
+            .collect();
+        let checked: Vec<bool> = statuses
+            .iter()
+            .map(|s| matches!(s, crate::agents::AgentStatus::Configured))
+            .collect();
+        match dialoguer::MultiSelect::new()
+            .with_prompt("Select agents to connect to memd (space toggles, enter confirms)")
+            .items(&items)
+            .defaults(&checked)
+            .interact_opt()?
+        {
+            Some(picked) => (0..agents.len()).map(|i| picked.contains(&i)).collect(),
+            None => {
+                println!("• agent setup skipped");
+                return Ok(());
+            }
+        }
+    } else {
+        // Non-TTY: desired = detected (or already configured).
+        statuses
+            .iter()
+            .map(|s| !matches!(s, crate::agents::AgentStatus::NotDetected))
+            .collect()
+    };
+
+    for ((agent, status), want) in agents.iter().zip(&statuses).zip(&desired) {
+        match crate::agents::plan_action(status, *want, interactive) {
+            crate::agents::Action::Configure => {
+                match agent.configure(installed, &url, !no_hooks) {
+                    Ok(_) => println!("✓ {}: configured ({})", agent.name, agent.transport()),
+                    Err(e) => println!("⚠ {}: {e}", agent.name),
+                }
+            }
+            crate::agents::Action::Remove => match agent.remove() {
+                Ok(_) => println!("• {}: removed", agent.name),
+                Err(e) => println!("⚠ {}: {e}", agent.name),
+            },
+            crate::agents::Action::Skip => {}
+        }
+    }
+    println!("\nOpen a new agent session for the changes to take effect.");
     Ok(())
 }
 
@@ -644,23 +699,12 @@ pub async fn capture() -> Result<()> {
 
 /// Write the managed memd directive block into known agent instruction files.
 pub fn directives_install() -> Result<()> {
-    let block = directive_block();
-    for path in target_instruction_files() {
-        upsert_directive(&path, &block)?;
-        println!("Wrote memd directives to {}", path.display());
-    }
-    println!("\nReload your tools (or start a new session) for the directives to take effect.");
-    Ok(())
+    crate::agents::directives_install_all()
 }
 
 /// Remove the managed memd directive block from agent instruction files.
 pub fn directives_uninstall() -> Result<()> {
-    for path in target_instruction_files() {
-        if remove_directive(&path)? {
-            println!("Removed memd directives from {}", path.display());
-        }
-    }
-    Ok(())
+    crate::agents::directives_remove_all()
 }
 
 // --- helpers ---------------------------------------------------------------
@@ -799,79 +843,6 @@ fn truncate(s: &str, n: usize) -> String {
     out
 }
 
-const DIRECTIVE_START: &str = "<!-- memd:start (managed by `memd directives`) -->";
-const DIRECTIVE_END: &str = "<!-- memd:end -->";
-
-/// The managed directive block injected into agent instruction files.
-fn directive_block() -> String {
-    format!(
-        "{DIRECTIVE_START}\n\
-## Memory (memd)\n\
-`memd` is your persistent, cross-tool long-term memory — an always-on local MCP \
-server shared with all of your LLM tools.\n\
-- At the start of a task, call `get_memory` (set `scope` to the project path) to \
-load prior decisions, preferences, and facts before acting — don't ask the user \
-to repeat context you can recall.\n\
-- When you learn something durable (a decision, preference, fact, or reusable \
-solution), call `save_memory`.\n\
-- Use `read_memory(id)` for the full text and `list_memories` to browse.\n\
-{DIRECTIVE_END}"
-    )
-}
-
-/// Known global agent instruction files to inject directives into.
-fn target_instruction_files() -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if let Some(base) = directories::BaseDirs::new() {
-        let home = base.home_dir();
-        files.push(home.join(".claude").join("CLAUDE.md")); // Claude Code (global)
-        files.push(home.join(".codex").join("AGENTS.md")); // Codex (global)
-    }
-    files
-}
-
-/// Insert or replace the managed directive block in `path` (creating the file).
-fn upsert_directive(path: &PathBuf, block: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    let next = if let Some(region) = managed_region(&existing) {
-        existing.replacen(&region, block, 1)
-    } else if existing.trim().is_empty() {
-        format!("{block}\n")
-    } else {
-        format!("{}\n\n{block}\n", existing.trim_end())
-    };
-    std::fs::write(path, next).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-/// Remove the managed directive block from `path`. Returns whether it changed.
-fn remove_directive(path: &PathBuf) -> Result<bool> {
-    let Ok(existing) = std::fs::read_to_string(path) else {
-        return Ok(false);
-    };
-    let Some(region) = managed_region(&existing) else {
-        return Ok(false);
-    };
-    let cleaned = existing.replacen(&region, "", 1);
-    let cleaned = cleaned.replace("\n\n\n", "\n\n");
-    std::fs::write(path, cleaned.trim_start())?;
-    Ok(true)
-}
-
-/// Extract the current `<!-- memd:start --> … <!-- memd:end -->` region, if any.
-fn managed_region(text: &str) -> Option<String> {
-    let start = text.find(DIRECTIVE_START)?;
-    let end = text.find(DIRECTIVE_END)? + DIRECTIVE_END.len();
-    if end > start {
-        Some(text[start..end].to_string())
-    } else {
-        None
-    }
-}
-
 /// Prefer the stable installed binary; fall back to the running executable.
 pub fn resolve_memd_exe() -> PathBuf {
     if let Ok(p) = paths::installed_bin()
@@ -911,126 +882,6 @@ fn install_self() -> Result<PathBuf> {
         }
     }
     Ok(target)
-}
-
-/// Look up a command on PATH.
-fn which(cmd: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(cmd))
-        .find(|c| c.is_file())
-}
-
-/// Register memd as a user-scoped stdio MCP server in Claude Code, if the
-/// `claude` CLI is present. Converges on the stable binary path by re-adding.
-fn register_claude_code(installed: &Path) {
-    if which("claude").is_none() {
-        println!("• Claude Code CLI not found — skipping MCP registration.");
-        return;
-    }
-    let exe = installed.to_string_lossy().to_string();
-    // Drop any prior registration so it can't keep pointing at an old path.
-    let _ = std::process::Command::new("claude")
-        .args(["mcp", "remove", "memd", "-s", "user"])
-        .output();
-    let status = std::process::Command::new("claude")
-        .args([
-            "mcp", "add", "memd", "--scope", "user", "--", &exe, "mcp", "--stdio",
-        ])
-        .status();
-    match status {
-        Ok(s) if s.success() => println!("✓ Claude Code: registered memd (user scope, stdio)"),
-        _ => println!(
-            "⚠ Claude Code: registration failed — run `claude mcp add memd -- {exe} mcp --stdio`"
-        ),
-    }
-}
-
-/// Merge memd's SessionStart/Stop hooks into `~/.claude/settings.json`.
-/// Idempotent; returns whether the file changed.
-fn install_claude_hooks(installed: &Path) -> Result<bool> {
-    let path = directories::BaseDirs::new()
-        .context("home directory")?
-        .home_dir()
-        .join(".claude")
-        .join("settings.json");
-    let mut root: Value = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| json!({}));
-    if !root.is_object() {
-        root = json!({});
-    }
-
-    let exe = installed.to_string_lossy();
-    let session_cmd = format!("{exe} context --scope \"$CLAUDE_PROJECT_DIR\"");
-    let stop_cmd = format!("{exe} capture");
-
-    let mut changed = false;
-    changed |= ensure_hook(&mut root, "SessionStart", "context", &session_cmd, 10);
-    changed |= ensure_hook(&mut root, "Stop", "capture", &stop_cmd, 15);
-
-    if changed {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(&path, serde_json::to_string_pretty(&root)?)
-            .with_context(|| format!("writing {}", path.display()))?;
-    }
-    Ok(changed)
-}
-
-/// Ensure a `memd <marker>` command hook exists under `hooks.<event>`.
-fn ensure_hook(root: &mut Value, event: &str, marker: &str, command: &str, timeout: u64) -> bool {
-    let needle = format!("memd {marker}");
-    let hooks = root
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| json!({}));
-    let arr = hooks
-        .as_object_mut()
-        .unwrap()
-        .entry(event)
-        .or_insert_with(|| json!([]));
-    let Some(arr) = arr.as_array_mut() else {
-        return false;
-    };
-    // If a memd hook for this event already exists, leave it alone when its
-    // command is identical, otherwise replace it (converges on the new path).
-    if let Some(group) = arr.iter_mut().find(|group| {
-        group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .map(|hs| {
-                hs.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .map(|c| c.contains(&needle))
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false)
-    }) {
-        let current = group
-            .get("hooks")
-            .and_then(|h| h.as_array())
-            .and_then(|hs| hs.first())
-            .and_then(|h| h.get("command"))
-            .and_then(|c| c.as_str())
-            .unwrap_or("");
-        if current == command {
-            return false;
-        }
-        *group = json!({
-            "hooks": [ { "type": "command", "command": command, "timeout": timeout } ]
-        });
-        return true;
-    }
-    arr.push(json!({
-        "hooks": [ { "type": "command", "command": command, "timeout": timeout } ]
-    }));
-    true
 }
 
 /// Reset a Meilisearch database created by a different engine version: stop the

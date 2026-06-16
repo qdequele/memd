@@ -125,8 +125,8 @@ impl Agent {
         }
     }
 
-    /// Write memd's MCP entry, directives, and (if applicable) hooks.
-    pub fn configure(&self, bin: &Path, url: &str) -> Result<()> {
+    /// Write memd's MCP entry, directives, and (when `install_hooks`) hooks.
+    pub fn configure(&self, bin: &Path, url: &str, install_hooks: bool) -> Result<()> {
         match &self.mcp {
             McpKind::ClaudeCli => mcp::claude_register(url)?,
             McpKind::Json {
@@ -140,7 +140,7 @@ impl Agent {
         if let Some(path) = &self.directives {
             directives::upsert_directive(path)?;
         }
-        if self.hooks {
+        if self.hooks && install_hooks {
             let _ = hooks::install_claude_hooks(bin);
         }
         Ok(())
