@@ -127,6 +127,18 @@ pub async fn status() -> Result<()> {
         println!("Updates:      never checked (daily check runs in the daemon)");
     }
 
+    println!("Agents:");
+    for agent in crate::agents::registry() {
+        let line = match agent.status() {
+            crate::agents::AgentStatus::Configured => {
+                format!("configured ({})", agent.transport())
+            }
+            crate::agents::AgentStatus::Detected => "detected — not configured".to_string(),
+            crate::agents::AgentStatus::NotDetected => "not detected".to_string(),
+        };
+        println!("  {:<13} {}", agent.name, line);
+    }
+
     match crawler::last_summary() {
         Some(s) => println!(
             "Last crawl:   {} indexed, {} skipped, {} deleted, {} errors (at {})",
