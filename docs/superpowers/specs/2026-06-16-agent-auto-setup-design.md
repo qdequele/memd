@@ -37,17 +37,21 @@ whether it supports lifecycle hooks.
 | Agent | Detect via | MCP transport | MCP config mechanism | Directives file | Hooks |
 |---|---|---|---|---|---|
 | Claude Code | `claude` on PATH | HTTP | `claude mcp add` CLI | `~/.claude/CLAUDE.md` | ✅ SessionStart+Stop |
-| Codex | `~/.codex/` exists | stdio | `~/.codex/config.toml` `[mcp_servers.memd]` | `~/.codex/AGENTS.md` | — |
+| Codex | `~/.codex/` exists | HTTP | `~/.codex/config.toml` `[mcp_servers.memd]` `url` | `~/.codex/AGENTS.md` | — |
 | Gemini CLI | `~/.gemini/` exists | HTTP | `~/.gemini/settings.json` `mcpServers` | `~/.gemini/GEMINI.md` | — |
 | Cursor | `~/.cursor/` exists | HTTP | `~/.cursor/mcp.json` `mcpServers` | — | — |
 | Windsurf | `~/.codeium/windsurf/` exists | HTTP/SSE | `~/.codeium/windsurf/mcp_config.json` | — | — |
 | Cline | VS Code globalStorage dir | HTTP/SSE | `cline_mcp_settings.json` | — | — |
-| Zed | `~/.config/zed/` exists | stdio | `settings.json` `context_servers` | — | — |
+| Zed | `~/.config/zed/` exists | HTTP | `settings.json` `context_servers` `url` | — | — |
 
 **Transport rule:** register the always-on daemon's HTTP endpoint
 (`http://127.0.0.1:7702/mcp`, from `cfg.mcp.host`/`port`) where the agent supports
 HTTP/SSE; fall back to the stdio bridge (`memd mcp --stdio`) for stdio-only clients.
 This matches the "one shared server, many clients" recommendation in the MCP docs.
+(In practice all seven supported agents were verified HTTP-capable — Codex/Cursor/Zed
+via `url`, Gemini via `httpUrl`, Windsurf via `serverUrl`, Cline via `url`+`type`,
+Claude Code via `--transport http` — so every agent registers over HTTP and the stdio
+fallback is currently unused.)
 
 **Note on accuracy:** the exact config paths and JSON/TOML keys per agent are taken
 from current knowledge and MUST be verified against each agent's current docs at
@@ -128,7 +132,7 @@ the same registry/`status()` call:
 ```
 Agents:
   Claude Code   configured (HTTP)
-  Codex         configured (stdio)
+  Codex         configured (HTTP)
   Cursor        detected — not configured
   Gemini CLI    not detected
   …
