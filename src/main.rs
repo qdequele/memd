@@ -4,6 +4,7 @@
 //! persistent, time-aware, semantically-searchable memory layer shared across
 //! every LLM tool, exposed through one stable MCP server.
 
+mod agents;
 mod cli;
 mod config;
 mod crawler;
