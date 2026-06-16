@@ -28,6 +28,19 @@ memd exposes one stable MCP server over two transports.
   </Tab>
 </Tabs>
 
+## Connecting agents
+
+`memd setup` detects the LLM agents installed on your machine — Claude Code,
+Codex, Gemini CLI, Cursor, Windsurf, Cline, and Zed — and shows a checklist of
+which to connect. Each selected agent gets memd's MCP server registered (HTTP
+endpoint), plus usage directives and lifecycle hooks where supported. The
+checklist is the source of truth: un-checking a previously connected agent
+removes memd from it. In a non-interactive shell (CI, piped), `setup` connects
+every detected agent and removes nothing.
+
+Run `memd status` to see each agent's wiring state (`configured`, `detected —
+not configured`, or `not detected`).
+
 ## Tools
 
 The MVP contract is `save_memory` + `get_memory`; the rest are additive.

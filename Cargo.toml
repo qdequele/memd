@@ -31,6 +31,7 @@ walkdir = "2"
 globset = "0.4"
 futures-util = "0.3"
 time = { version = "0.3", features = ["formatting"] }
+dialoguer = { version = "0.11", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
