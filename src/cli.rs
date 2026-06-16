@@ -575,7 +575,6 @@ fn configure_agents(installed: &Path, cfg: &Config, no_hooks: bool) -> Result<()
             crate::agents::Action::Skip => {}
         }
     }
-    println!("\nOpen a new agent session for the changes to take effect.");
     Ok(())
 }
 
