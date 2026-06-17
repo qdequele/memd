@@ -37,6 +37,8 @@ enum Command {
     },
     /// Stop the running daemon.
     Down,
+    /// Ensure the daemon is running (fast, silent; used by the SessionStart hook).
+    Ensure,
     /// Show daemon + Meilisearch health, index stats, and last crawl.
     Status,
     /// Tail the daemon logs.
@@ -146,6 +148,11 @@ enum Command {
         #[command(subcommand)]
         action: DirectivesAction,
     },
+    /// Install/remove memd's Claude Code skills (~/.claude/skills/).
+    Skills {
+        #[command(subcommand)]
+        action: SkillsAction,
+    },
     /// One-command install: relocate the binary, start the daemon, register
     /// with detected agents, install directives, and wire up hooks.
     Setup {
@@ -193,12 +200,21 @@ enum DirectivesAction {
     Uninstall,
 }
 
+#[derive(Subcommand)]
+enum SkillsAction {
+    /// Write memd's skills into ~/.claude/skills/.
+    Install,
+    /// Remove memd's skills from ~/.claude/skills/.
+    Uninstall,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Up { foreground } => cli::up(foreground).await,
         Command::Down => cli::down().await,
+        Command::Ensure => cli::ensure().await,
         Command::Status => cli::status().await,
         Command::Logs { follow } => cli::logs(follow).await,
         Command::Serve => daemon::serve().await,
@@ -253,6 +269,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Directives { action } => match action {
             DirectivesAction::Install => cli::directives_install(),
             DirectivesAction::Uninstall => cli::directives_uninstall(),
+        },
+        Command::Skills { action } => match action {
+            SkillsAction::Install => cli::skills_install(),
+            SkillsAction::Uninstall => cli::skills_uninstall(),
         },
         Command::Setup { no_hooks } => cli::setup(no_hooks).await,
         Command::Doctor { fix } => cli::doctor(fix).await,

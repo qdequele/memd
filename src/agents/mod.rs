@@ -5,6 +5,7 @@
 mod directives;
 mod hooks;
 mod mcp;
+mod skills;
 
 use crate::config::Config;
 use anyhow::Result;
@@ -13,6 +14,11 @@ use std::path::{Path, PathBuf};
 // Re-exported for `cli::directives_install`/`uninstall`, wired up in Task 6.
 #[allow(unused_imports)]
 pub use directives::{install_all as directives_install_all, remove_all as directives_remove_all};
+
+// Re-exported for `cli::skills_install`/`uninstall`.
+pub use skills::{
+    install_claude_skills as skills_install_all, remove_claude_skills as skills_remove_all,
+};
 
 /// The HTTP MCP endpoint every agent registers against.
 pub fn mcp_url(cfg: &Config) -> String {
@@ -92,6 +98,8 @@ pub struct Agent {
     mcp: McpKind,
     pub directives: Option<PathBuf>,
     pub hooks: bool,
+    /// Whether memd ships invokable skills into this agent (Claude Code only).
+    pub skills: bool,
 }
 
 impl Agent {
@@ -143,6 +151,11 @@ impl Agent {
         if self.hooks && install_hooks {
             let _ = hooks::install_claude_hooks(bin);
         }
+        // Skills are inert until invoked, so they're installed regardless of the
+        // `--no-hooks` opt-out (which is about the auto-running session hooks).
+        if self.skills {
+            let _ = skills::install_claude_skills();
+        }
         Ok(())
     }
 
@@ -163,6 +176,9 @@ impl Agent {
         }
         if self.hooks {
             let _ = hooks::remove_claude_hooks();
+        }
+        if self.skills {
+            let _ = skills::remove_claude_skills();
         }
         Ok(())
     }
@@ -206,6 +222,7 @@ pub fn registry() -> Vec<Agent> {
             mcp: McpKind::ClaudeCli,
             directives: Some(h.join(".claude/CLAUDE.md")),
             hooks: true,
+            skills: true,
         },
         Agent {
             id: "codex",
@@ -216,6 +233,7 @@ pub fn registry() -> Vec<Agent> {
             },
             directives: Some(h.join(".codex/AGENTS.md")),
             hooks: false,
+            skills: false,
         },
         Agent {
             id: "gemini-cli",
@@ -229,6 +247,7 @@ pub fn registry() -> Vec<Agent> {
             },
             directives: Some(h.join(".gemini/GEMINI.md")),
             hooks: false,
+            skills: false,
         },
         Agent {
             id: "cursor",
@@ -242,6 +261,7 @@ pub fn registry() -> Vec<Agent> {
             },
             directives: None,
             hooks: false,
+            skills: false,
         },
         Agent {
             id: "windsurf",
@@ -255,6 +275,7 @@ pub fn registry() -> Vec<Agent> {
             },
             directives: None,
             hooks: false,
+            skills: false,
         },
         Agent {
             id: "cline",
@@ -268,6 +289,7 @@ pub fn registry() -> Vec<Agent> {
             },
             directives: None,
             hooks: false,
+            skills: false,
         },
         Agent {
             id: "zed",
@@ -281,6 +303,7 @@ pub fn registry() -> Vec<Agent> {
             },
             directives: None,
             hooks: false,
+            skills: false,
         },
     ]
 }

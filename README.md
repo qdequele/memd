@@ -64,7 +64,8 @@ git clone https://github.com/qdequele/memd && cd memd
 | 🔍 Meilisearch | Pinned engine downloaded + started as a managed service (no Docker) |
 | 🔌 Agents | Interactive picker — choose from detected agents (Claude Code, Codex, Gemini CLI, Cursor, Windsurf, Cline, Zed); selected ones get memd's MCP server registered |
 | 📝 Directives | Usage block written into agent instruction files (Claude Code, Codex, Gemini CLI) |
-| 🪝 Hooks | SessionStart (auto-recall) + Stop (auto-capture) wired into Claude Code |
+| 🪝 Hooks | SessionStart (ensure daemon + auto-recall) + Stop (auto-capture) wired into Claude Code |
+| 🎯 Skills | `/memd-doctor` (diagnose & repair) + `/memd-memory` (recall/save playbook) installed for Claude Code |
 
 It's **idempotent** — re-run any time (e.g. after an upgrade) to reconverge.
 

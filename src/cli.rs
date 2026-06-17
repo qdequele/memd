@@ -54,6 +54,46 @@ pub async fn up(foreground: bool) -> Result<()> {
     bail!("daemon did not become healthy in time; check `memd logs`")
 }
 
+/// Best-effort: make sure the daemon is running, fast and silent. Used by the
+/// Claude Code SessionStart hook so memory keeps working even if the daemon
+/// died or was never started. Prints nothing to stdout (the hook injects its
+/// output into the session) and never errors out the caller — a failure here
+/// must not disrupt a session start.
+pub async fn ensure() -> Result<()> {
+    let Ok(cfg) = Config::load_or_init() else {
+        return Ok(());
+    };
+    if daemon_healthy(&cfg).await {
+        return Ok(());
+    }
+    if let Err(e) = ensure_running(&cfg).await {
+        eprintln!("memd ensure: could not start daemon: {e:#}");
+    }
+    Ok(())
+}
+
+/// Start the daemon without `up`'s long readiness wait: kick the launchd service
+/// (or spawn a detached process), then poll briefly so a following `context`
+/// call in the same hook can already see it healthy. Silent on stdout.
+async fn ensure_running(cfg: &Config) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        if launchd::is_installed() {
+            let _ = launchd::load();
+        } else {
+            launchd::install(&resolve_memd_exe())?;
+        }
+    } else {
+        spawn_detached()?;
+    }
+    for _ in 0..10 {
+        if daemon_healthy(cfg).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Ok(())
+}
+
 /// Stop the daemon (launchd unload, or kill the recorded pid).
 pub async fn down() -> Result<()> {
     if launchd::is_installed() {
@@ -714,6 +754,27 @@ pub fn directives_install() -> Result<()> {
 /// Remove the managed memd directive block from agent instruction files.
 pub fn directives_uninstall() -> Result<()> {
     crate::agents::directives_remove_all()
+}
+
+/// Write memd's Claude Code skills into `~/.claude/skills/`.
+pub fn skills_install() -> Result<()> {
+    if crate::agents::skills_install_all()? {
+        println!("Installed memd skills into ~/.claude/skills/ (memd-doctor, memd-memory).");
+        println!("Start a new Claude Code session to pick them up.");
+    } else {
+        println!("memd skills are already up to date.");
+    }
+    Ok(())
+}
+
+/// Remove memd's Claude Code skills from `~/.claude/skills/`.
+pub fn skills_uninstall() -> Result<()> {
+    if crate::agents::skills_remove_all()? {
+        println!("Removed memd skills from ~/.claude/skills/.");
+    } else {
+        println!("No memd skills to remove.");
+    }
+    Ok(())
 }
 
 // --- helpers ---------------------------------------------------------------
