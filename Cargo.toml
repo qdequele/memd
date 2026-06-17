@@ -1,6 +1,6 @@
 [package]
 name = "memd"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Universal local memory daemon for LLMs, backed by Meilisearch"
 authors = ["Quentin de Quelen <quentin@meilisearch.com>"]
