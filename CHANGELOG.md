@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.0](https://github.com/qdequele/memd/compare/v0.3.0...v0.4.0) (2026-06-17)
+
+
+### Features
+
+* **agents:** ship memd skills + a self-healing SessionStart hook ([c7aefb3](https://github.com/qdequele/memd/commit/c7aefb3cdd4e9f9d30a74ec6554a450da4498640))
+* **agents:** ship memd skills + a self-healing SessionStart hook ([1159449](https://github.com/qdequele/memd/commit/11594495e828381f7dcf1a39f632482cb3ea0f12))
+
 ## [0.3.0](https://github.com/qdequele/memd/compare/v0.2.0...v0.3.0) (2026-06-16)
 
 
