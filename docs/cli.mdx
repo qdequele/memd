@@ -9,6 +9,7 @@ description: "Every memd subcommand."
 |---------|-------------|
 | `memd up [--foreground]` | Start the daemon (Meilisearch + crawler + MCP); install the launchd service. `--foreground` runs the daemon process directly. |
 | `memd down` | Stop the daemon (launchd unload, or signal the recorded pid). |
+| `memd ensure` | Best-effort: start the daemon if it's down, fast and silent. Used by the SessionStart hook so recall keeps working after a crash; never errors out the caller. |
 | `memd status` | Daemon + Meilisearch health, index stats, and last crawl. |
 | `memd logs [-f]` | Print (or follow) the daemon log file. |
 | `memd serve` | Run the daemon in the foreground (used by the service runner). |
@@ -93,6 +94,11 @@ These wire memd into your agents so it's used as primary memory (see
 | `memd capture` | Read a **Stop**-hook JSON payload on stdin and conservatively save the turn *only* when the user's message signals durable intent ("remember…", "we decided…", …). |
 | `memd directives install` | Write a managed memd-usage block into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, etc. (idempotent). |
 | `memd directives uninstall` | Remove the managed block. |
+| `memd skills install` | Install memd's Claude Code skills into `~/.claude/skills/`: `/memd-doctor` (diagnose & repair) and `/memd-memory` (recall/save playbook). Idempotent. |
+| `memd skills uninstall` | Remove memd's skills. |
+
+`memd setup` does all of the above for the agents you select; the commands are
+here for manual control and re-running after edits.
 
 Example `~/.claude/settings.json` hooks:
 
@@ -100,7 +106,7 @@ Example `~/.claude/settings.json` hooks:
 {
   "hooks": {
     "SessionStart": [{ "hooks": [{ "type": "command",
-      "command": "/path/to/memd context --scope \"$CLAUDE_PROJECT_DIR\"" }] }],
+      "command": "/path/to/memd ensure; /path/to/memd context --scope \"$CLAUDE_PROJECT_DIR\"" }] }],
     "Stop": [{ "hooks": [{ "type": "command",
       "command": "/path/to/memd capture" }] }]
   }

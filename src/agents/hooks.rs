@@ -23,7 +23,10 @@ pub fn install_claude_hooks(installed: &Path) -> Result<bool> {
     }
 
     let exe = installed.to_string_lossy();
-    let session_cmd = format!("{exe} context --scope \"$CLAUDE_PROJECT_DIR\"");
+    // `ensure` (best-effort, silent) revives a dead daemon so recall keeps
+    // working even if it crashed or was never started; `;` runs `context`
+    // regardless of its outcome (context degrades gracefully when down).
+    let session_cmd = format!("{exe} ensure; {exe} context --scope \"$CLAUDE_PROJECT_DIR\"");
     let stop_cmd = format!("{exe} capture");
 
     let mut changed = false;
