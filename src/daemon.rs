@@ -4,7 +4,7 @@
 
 use crate::config::Config;
 use crate::memory::MemoryService;
-use crate::{crawler, mcp, meili, paths, update};
+use crate::{crawler, logging, mcp, meili, paths, update};
 use anyhow::{Context, Result};
 use std::time::Duration;
 
@@ -31,8 +31,10 @@ pub async fn serve() -> Result<()> {
         update::engine::Applied::None => {}
     }
 
-    // 1. Start the managed Meilisearch child process.
+    // 1. Start the managed Meilisearch child process. Its output flows through
+    //    our size-capped log writer, not an unbounded supervisor redirect.
     let mut child = meili::spawn(&cfg).await?;
+    meili::forward_output(&mut child);
     let svc = MemoryService::from_config(&cfg);
 
     // 2. Wait for health, then ensure the index + local embedder.
@@ -47,7 +49,30 @@ pub async fn serve() -> Result<()> {
         .context("ensuring memory_events index")?;
     tracing::info!("Meilisearch ready; indexes configured");
 
-    // 3. Crawler + watcher in the background.
+    // Restart channel: the updater and the health watchdog both use it.
+    let (restart_tx, mut restart_rx) = tokio::sync::mpsc::channel::<&'static str>(1);
+
+    // 3. Watchdog: the child staying alive is not enough — Meilisearch can
+    //    wedge (process up, every request failing, e.g. after disk pressure).
+    //    Restart the daemon when health checks fail long enough.
+    let watchdog_client = svc.client().clone();
+    let watchdog_tx = restart_tx.clone();
+    let watchdog = tokio::spawn(async move {
+        let mut detector = meili::WedgeDetector::new(4);
+        let mut ticks = tokio::time::interval(Duration::from_secs(30));
+        ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticks.tick().await; // skip the immediate first tick
+        loop {
+            ticks.tick().await;
+            if detector.observe(watchdog_client.is_healthy().await) {
+                tracing::error!("Meilisearch is wedged (alive but unhealthy) — restarting");
+                let _ = watchdog_tx.send("meilisearch wedged").await;
+                return;
+            }
+        }
+    });
+
+    // 4. Crawler + watcher in the background.
     let crawl_cfg = cfg.clone();
     let crawl_svc = svc.clone();
     let crawler_task = tokio::spawn(async move {
@@ -56,7 +81,7 @@ pub async fn serve() -> Result<()> {
         }
     });
 
-    // 4. HTTP MCP endpoint.
+    // 5. HTTP MCP endpoint.
     let addr = format!("{}:{}", cfg.mcp.host, cfg.mcp.port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -70,20 +95,20 @@ pub async fn serve() -> Result<()> {
         }
     });
 
-    // 5. Daily auto-update check; a prepared update requests a restart.
-    let (restart_tx, mut restart_rx) = tokio::sync::mpsc::channel::<&'static str>(1);
+    // 6. Daily auto-update check; a prepared update requests a restart.
     let upd_cfg = cfg.clone();
     let updater = tokio::spawn(async move {
         update::run_loop(upd_cfg, restart_tx).await;
     });
 
-    // 6. Wait for a shutdown signal, child exit, or a restart request.
+    // 7. Wait for a shutdown signal, child exit, or a restart request.
     let restart = shutdown_signal(&mut child, &mut restart_rx).await;
 
     tracing::info!("shutting down");
     crawler_task.abort();
     server.abort();
     updater.abort();
+    watchdog.abort();
     let _ = child.kill().await;
     let _ = std::fs::remove_file(paths::pid_file()?);
 
@@ -151,13 +176,15 @@ async fn shutdown_signal(
     }
 }
 
-/// Configure tracing to append to the daemon log file. The returned guard must
-/// be kept alive for logs to flush.
+/// Configure tracing to append to the daemon log file, size-capped: the file
+/// is rotated to `memd.log.1` when it outgrows [`logging::MAX_LOG_BYTES`], so
+/// the log can never fill the disk again. The returned guard must be kept
+/// alive for logs to flush.
 fn init_logging() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     let log_path = paths::log_file()?;
-    let dir = log_path.parent().unwrap().to_path_buf();
-    let file_name = log_path.file_name().unwrap().to_string_lossy().to_string();
-    let appender = tracing_appender::rolling::never(dir, file_name);
+    // Bound a log left oversized by a previous run before opening it.
+    logging::rotate_if_oversized(&log_path, logging::MAX_LOG_BYTES)?;
+    let appender = logging::SizeRotatingWriter::new(log_path, logging::MAX_LOG_BYTES)?;
     let (writer, guard) = tracing_appender::non_blocking(appender);
 
     use tracing_subscriber::EnvFilter;

@@ -41,6 +41,7 @@ pub async fn scan(cfg: &Config, svc: &MemoryService) -> Result<CrawlSummary> {
     let mut summary = CrawlSummary::default();
     let mut seen: HashSet<String> = HashSet::new();
     let mut batch: Vec<MemoryItem> = Vec::new();
+    let mut warn_limit = crate::logging::LogLimiter::new(10);
     const BATCH: usize = 200;
 
     for root in cfg.expand_roots() {
@@ -93,7 +94,11 @@ pub async fn scan(cfg: &Config, svc: &MemoryService) -> Result<CrawlSummary> {
                         }
                         Ok(None) => summary.skipped += 1,
                         Err(e) => {
-                            tracing::warn!("preparing {path_str} failed: {e}");
+                            // Cap the per-file noise: with the engine down, a
+                            // scan can fail on every single file.
+                            if warn_limit.should_log() {
+                                tracing::warn!("preparing {path_str} failed: {e}");
+                            }
                             summary.errors += 1;
                         }
                     }
@@ -104,6 +109,12 @@ pub async fn scan(cfg: &Config, svc: &MemoryService) -> Result<CrawlSummary> {
         }
     }
     flush(svc, &mut batch, &mut summary).await;
+    if warn_limit.suppressed() > 0 {
+        tracing::warn!(
+            "{} more file preparation failures not logged individually",
+            warn_limit.suppressed()
+        );
+    }
 
     // Deletions: drop crawler docs whose source file no longer matches.
     summary.deleted = reconcile_deletions(svc, &seen).await.unwrap_or(0);

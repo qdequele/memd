@@ -11,6 +11,7 @@ mod crawler;
 mod daemon;
 mod history;
 mod launchd;
+mod logging;
 mod mcp;
 mod meili;
 mod memory;

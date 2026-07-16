@@ -104,10 +104,121 @@ pub async fn download_binary(version: &str) -> Result<PathBuf> {
 
 /// Spawn the managed Meilisearch as a child process.
 ///
-/// `stdout`/`stderr` are inherited so the daemon's log redirection captures
-/// them. The caller owns the returned [`Child`] and its lifecycle.
+/// `stdout`/`stderr` are piped; callers must drain them (see
+/// [`forward_output`]) or the child blocks once the pipe buffer fills. The
+/// caller owns the returned [`Child`] and its lifecycle.
 pub async fn spawn(cfg: &Config) -> Result<Child> {
     spawn_with_import(cfg, None).await
+}
+
+/// Command-line arguments for the managed Meilisearch. `--log-level WARN`
+/// keeps it from logging every HTTP request — at INFO an unhealthy instance
+/// once grew the daemon log to 9 GB.
+fn build_args(
+    cfg: &Config,
+    db: &std::path::Path,
+    dumps: &std::path::Path,
+    snapshots: &std::path::Path,
+    import_dump: Option<&std::path::Path>,
+) -> Vec<std::ffi::OsString> {
+    let addr = format!("{}:{}", cfg.meilisearch.host, cfg.meilisearch.port);
+    let mut args: Vec<std::ffi::OsString> = vec![
+        "--db-path".into(),
+        db.into(),
+        "--dump-dir".into(),
+        dumps.into(),
+        "--snapshot-dir".into(),
+        snapshots.into(),
+        "--http-addr".into(),
+        addr.into(),
+        "--master-key".into(),
+        cfg.meilisearch.master_key.clone().into(),
+        "--no-analytics".into(),
+        "--env".into(),
+        "production".into(),
+        "--log-level".into(),
+        "WARN".into(),
+    ];
+    if let Some(dump) = import_dump {
+        args.push("--import-dump".into());
+        args.push(dump.into());
+    }
+    args
+}
+
+/// Drain the child's stdout/stderr into our tracing log so Meilisearch output
+/// goes through the daemon's size-capped writer instead of an unbounded
+/// supervisor redirect. Must be called once per spawned child.
+pub fn forward_output(child: &mut Child) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let streams: [Option<Box<dyn tokio::io::AsyncRead + Send + Unpin>>; 2] = [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+    ];
+    for stream in streams.into_iter().flatten() {
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stream).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(target: "meilisearch", "{}", strip_ansi(&line));
+            }
+        });
+    }
+}
+
+/// Remove ANSI SGR escape sequences (`ESC [ … m`) — Meilisearch colors its
+/// log lines even when writing to a pipe, and raw escapes would litter our
+/// log file.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip "[<params>m"; tolerate a bare ESC by dropping just it.
+            if chars.clone().next() == Some('[') {
+                for c2 in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Detects a wedged engine: the process is alive but health checks keep
+/// failing. Fires once `threshold` consecutive checks have failed; a healthy
+/// check resets the streak.
+pub struct WedgeDetector {
+    threshold: u32,
+    consecutive: u32,
+}
+
+impl WedgeDetector {
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            threshold,
+            consecutive: 0,
+        }
+    }
+
+    /// Record one health-check result. Returns true while wedged.
+    pub fn observe(&mut self, healthy: bool) -> bool {
+        if healthy {
+            self.consecutive = 0;
+        } else {
+            self.consecutive = self.consecutive.saturating_add(1);
+        }
+        self.consecutive >= self.threshold
+    }
 }
 
 /// Like [`spawn`], but optionally boot with `--import-dump` (used by engine
@@ -129,28 +240,17 @@ pub async fn spawn_with_import(
     let snapshots = data.join("snapshots");
     std::fs::create_dir_all(&snapshots)?;
 
-    let addr = format!("{}:{}", cfg.meilisearch.host, cfg.meilisearch.port);
-    tracing::info!("starting Meilisearch on {addr}");
+    tracing::info!(
+        "starting Meilisearch on {}:{}",
+        cfg.meilisearch.host,
+        cfg.meilisearch.port
+    );
 
-    let mut cmd = Command::new(&bin);
-    cmd.current_dir(&data)
-        .arg("--db-path")
-        .arg(&db)
-        .arg("--dump-dir")
-        .arg(&dumps)
-        .arg("--snapshot-dir")
-        .arg(&snapshots)
-        .arg("--http-addr")
-        .arg(&addr)
-        .arg("--master-key")
-        .arg(&cfg.meilisearch.master_key)
-        .arg("--no-analytics")
-        .arg("--env")
-        .arg("production");
-    if let Some(dump) = import_dump {
-        cmd.arg("--import-dump").arg(dump);
-    }
-    let child = cmd
+    let child = Command::new(&bin)
+        .current_dir(&data)
+        .args(build_args(cfg, &db, &dumps, &snapshots, import_dump))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawning {}", bin.display()))?;
@@ -167,4 +267,67 @@ pub async fn wait_healthy(client: &MeiliClient, timeout: Duration) -> Result<()>
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     bail!("Meilisearch did not become healthy within {:?}", timeout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn wedge_detector_fires_after_threshold_consecutive_failures() {
+        let mut d = WedgeDetector::new(3);
+        assert!(!d.observe(false));
+        assert!(!d.observe(false));
+        assert!(d.observe(false), "third consecutive failure = wedged");
+        assert!(d.observe(false), "stays wedged while failures continue");
+    }
+
+    #[test]
+    fn wedge_detector_resets_on_healthy() {
+        let mut d = WedgeDetector::new(2);
+        assert!(!d.observe(false));
+        assert!(!d.observe(true), "healthy check resets the streak");
+        assert!(!d.observe(false));
+        assert!(d.observe(false));
+    }
+
+    #[test]
+    fn spawn_args_cap_meilisearch_log_level() {
+        let cfg = Config::default();
+        let args = build_args(
+            &cfg,
+            Path::new("/db"),
+            Path::new("/dumps"),
+            Path::new("/snapshots"),
+            None,
+        );
+        let pos = args
+            .iter()
+            .position(|a| a == "--log-level")
+            .expect("--log-level must be passed so Meilisearch does not log every request");
+        assert_eq!(args[pos + 1], "WARN");
+    }
+
+    #[test]
+    fn strip_ansi_removes_color_codes_and_keeps_text() {
+        assert_eq!(
+            strip_ansi("\x1b[2m2026-07-15T23:48:05Z\x1b[0m \x1b[33m WARN\x1b[0m boom"),
+            "2026-07-15T23:48:05Z  WARN boom"
+        );
+        assert_eq!(strip_ansi("plain text"), "plain text");
+    }
+
+    #[test]
+    fn spawn_args_include_import_dump_when_given() {
+        let cfg = Config::default();
+        let args = build_args(
+            &cfg,
+            Path::new("/db"),
+            Path::new("/dumps"),
+            Path::new("/snapshots"),
+            Some(Path::new("/dumps/x.dump")),
+        );
+        assert!(args.iter().any(|a| a == "--import-dump"));
+    }
 }

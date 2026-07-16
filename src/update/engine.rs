@@ -217,6 +217,7 @@ async fn import_and_verify(cfg: &Config, m: &Migration) -> Result<()> {
     let mut new_cfg = cfg.clone();
     new_cfg.meilisearch.version = m.to.clone();
     let mut child = meili::spawn_with_import(&new_cfg, Some(&m.dump_path)).await?;
+    meili::forward_output(&mut child);
     let client = MeiliClient::new(new_cfg.meili_url(), new_cfg.meilisearch.master_key.clone());
 
     let result = async {
