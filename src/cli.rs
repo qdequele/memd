@@ -13,6 +13,24 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// What `memd up` should do given the two health signals. The MCP endpoint
+/// answering is not enough: a wedged daemon (process alive, Meilisearch
+/// unhealthy) must be restarted, not reported as "already running".
+#[derive(Debug, PartialEq)]
+enum UpAction {
+    AlreadyRunning,
+    RestartWedged,
+    Start,
+}
+
+fn up_action(mcp_up: bool, meili_up: bool) -> UpAction {
+    match (mcp_up, meili_up) {
+        (true, true) => UpAction::AlreadyRunning,
+        (true, false) => UpAction::RestartWedged,
+        (false, _) => UpAction::Start,
+    }
+}
+
 /// Start the daemon. In foreground mode this *is* the daemon; otherwise it
 /// installs the launchd service (macOS) or spawns a detached process.
 pub async fn up(foreground: bool) -> Result<()> {
@@ -21,12 +39,21 @@ pub async fn up(foreground: bool) -> Result<()> {
     }
 
     let cfg = Config::load_or_init()?;
-    if daemon_healthy(&cfg).await {
-        println!(
-            "memd is already running (MCP on http://{}:{}).",
-            cfg.mcp.host, cfg.mcp.port
-        );
-        return Ok(());
+    let svc = MemoryService::from_config(&cfg);
+    match up_action(daemon_healthy(&cfg).await, svc.client().is_healthy().await) {
+        UpAction::AlreadyRunning => {
+            println!(
+                "memd is already running (MCP on http://{}:{}).",
+                cfg.mcp.host, cfg.mcp.port
+            );
+            return Ok(());
+        }
+        UpAction::RestartWedged => {
+            println!("memd is running but Meilisearch is not responding — restarting the daemon…");
+            down().await?;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        UpAction::Start => {}
     }
 
     if cfg!(target_os = "macos") {
@@ -36,10 +63,10 @@ pub async fn up(foreground: bool) -> Result<()> {
         println!("Started memd daemon in the background.");
     }
 
-    // Wait for the MCP endpoint to come up.
+    // Wait for both the MCP endpoint and Meilisearch to come up.
     print!("Waiting for daemon to become healthy");
     for _ in 0..120 {
-        if daemon_healthy(&cfg).await {
+        if daemon_healthy(&cfg).await && svc.client().is_healthy().await {
             println!(
                 "\nmemd is up. MCP: http://{}:{}/mcp",
                 cfg.mcp.host, cfg.mcp.port
@@ -1117,4 +1144,27 @@ async fn restart_service(cfg: &Config) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn up_reports_already_running_only_when_fully_healthy() {
+        assert_eq!(up_action(true, true), UpAction::AlreadyRunning);
+    }
+
+    #[test]
+    fn up_restarts_when_mcp_is_up_but_meilisearch_is_down() {
+        // The wedged state: daemon process alive, engine dead. "already
+        // running" here would leave memory broken.
+        assert_eq!(up_action(true, false), UpAction::RestartWedged);
+    }
+
+    #[test]
+    fn up_starts_when_daemon_is_down() {
+        assert_eq!(up_action(false, false), UpAction::Start);
+        assert_eq!(up_action(false, true), UpAction::Start);
+    }
 }
