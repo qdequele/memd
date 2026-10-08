@@ -160,10 +160,8 @@ impl Crawler {
         let s = file.to_string_lossy();
         if let Some(i) = s.find("/.claude/projects/") {
             let rest = &s[i + "/.claude/projects/".len()..];
-            if let Some(slug) = rest.split('/').next()
-                && let Some(dir) = slugs.get(slug)
-            {
-                return dir.to_string_lossy().to_string();
+            if let Some(slug) = rest.split('/').next() {
+                return resolve_claude_slug(slug, slugs);
             }
         }
         "global".to_string()
@@ -215,6 +213,47 @@ pub fn claude_slug(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect()
+}
+
+/// Map a Claude Code project slug back to a scope path. In order: an exact
+/// known repository; the repository a worktree slug belongs to
+/// (`<repo>--claude-worktrees-<name>`); the longest known repository the slug
+/// extends (a sub-directory session); and finally a path reconstructed from
+/// the slug itself. A session's memory is never made `global`: that would
+/// inject it into every other project.
+pub fn resolve_claude_slug(slug: &str, slugs: &HashMap<String, PathBuf>) -> String {
+    if let Some(dir) = slugs.get(slug) {
+        return dir.to_string_lossy().to_string();
+    }
+    if let Some(i) = slug.find("--claude-worktrees-")
+        && let Some(dir) = slugs.get(&slug[..i])
+    {
+        return dir.to_string_lossy().to_string();
+    }
+    let mut best: Option<(&String, &PathBuf)> = None;
+    for (k, v) in slugs {
+        if slug.starts_with(k.as_str())
+            && slug[k.len()..].starts_with('-')
+            && best.map(|(b, _)| k.len() > b.len()).unwrap_or(true)
+        {
+            best = Some((k, v));
+        }
+    }
+    if let Some((_, dir)) = best {
+        return dir.to_string_lossy().to_string();
+    }
+    // `-Users-q-Projects-foo` → `/Users/q/Projects/foo` (lossy: `_` and `.`
+    // also became `-`, but the result is still a path only that session uses).
+    let guess: String = slug
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("/{p}"))
+        .collect();
+    if guess.is_empty() {
+        "global".to_string()
+    } else {
+        guess
+    }
 }
 
 /// A linked git worktree has a `.git` *file* (pointing at the main repo's
@@ -653,8 +692,18 @@ mod tests {
         let slugs = HashMap::from([(claude_slug("/Users/q/Projects/foo"), project.clone())]);
         let f = Path::new("/Users/q/.claude/projects/-Users-q-Projects-foo/memory/x.md");
         assert_eq!(c.knowledge_scope(f, &slugs), "/Users/q/Projects/foo");
+        // A worktree session belongs to its repository.
+        let wt = Path::new(
+            "/Users/q/.claude/projects/-Users-q-Projects-foo--claude-worktrees-wt-1/memory/x.md",
+        );
+        assert_eq!(c.knowledge_scope(wt, &slugs), "/Users/q/Projects/foo");
+        // A sub-directory session belongs to the repository it extends.
+        let sub =
+            Path::new("/Users/q/.claude/projects/-Users-q-Projects-foo-crates-core/memory/x.md");
+        assert_eq!(c.knowledge_scope(sub, &slugs), "/Users/q/Projects/foo");
+        // Unknown: reconstructed, never global.
         let unknown = Path::new("/Users/q/.claude/projects/-Users-q-elsewhere/memory/x.md");
-        assert_eq!(c.knowledge_scope(unknown, &slugs), "global");
+        assert_eq!(c.knowledge_scope(unknown, &slugs), "/Users/q/elsewhere");
         assert_eq!(
             c.knowledge_scope(Path::new("/Users/q/.codex/memories/MEMORY.md"), &slugs),
             "global"

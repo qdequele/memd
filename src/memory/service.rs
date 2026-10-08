@@ -241,10 +241,13 @@ impl MemoryService {
             created_at = old_created;
         }
 
+        let title = title
+            .or_else(|| frontmatter_title(&content))
+            .or_else(|| Some(file_title(source_path)));
         Some(MemoryItem {
             id,
             content,
-            title: title.or_else(|| Some(file_title(source_path))),
+            title,
             summary: None,
             r#type: ty.to_string(),
             tags: vec![],
@@ -644,6 +647,24 @@ fn derive_title(content: &str) -> Option<String> {
     if title.is_empty() { None } else { Some(title) }
 }
 
+/// Title from a YAML front matter block: `description:` first (what agents
+/// write their memory summaries into), else `name:`/`title:`.
+fn frontmatter_title(content: &str) -> Option<String> {
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let block = &rest[..end];
+    let field = |key: &str| {
+        block.lines().find_map(|l| {
+            let v = l.strip_prefix(key)?.trim();
+            let v = v.trim_matches('"').trim_matches('\'').trim();
+            (!v.is_empty()).then(|| v.chars().take(120).collect::<String>())
+        })
+    };
+    field("description:")
+        .or_else(|| field("name:"))
+        .or_else(|| field("title:"))
+}
+
 /// Title for a crawled file: its file name.
 fn file_title(path: &str) -> String {
     std::path::Path::new(path)
@@ -806,6 +827,17 @@ mod tests {
             .to_string_lossy()
             .to_string();
         assert_eq!(normalize_scope(Some("~/x/")), home);
+    }
+
+    #[test]
+    fn frontmatter_titles() {
+        let md = "---\nname: foo\ndescription: \"Why we chose X\"\n---\n\nbody";
+        assert_eq!(frontmatter_title(md).as_deref(), Some("Why we chose X"));
+        assert_eq!(
+            frontmatter_title("---\nname: bar\n---\n").as_deref(),
+            Some("bar")
+        );
+        assert_eq!(frontmatter_title("# plain"), None);
     }
 
     #[test]

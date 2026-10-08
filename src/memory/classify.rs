@@ -85,13 +85,15 @@ pub fn classify_path(path: &str) -> Option<MemoryType> {
         return Some(MemoryType::ProjectOverview);
     }
 
-    // Agent memory files: `MEMORY.md` anywhere, or Markdown inside a known
-    // memory directory. Claude Code's memory lives under
-    // `~/.claude/projects/<slug>/memory/`; the `/memory/` component is required
-    // so the slug directory's other files are left alone.
+    // `MEMORY.md` is an index of other memory files (Claude Code, Codex), not
+    // a memory itself: searchable as a reference, never injected as context.
     if lower == "memory.md" {
-        return Some(MemoryType::Fact);
+        return Some(MemoryType::Reference);
     }
+    // Agent memory files: Markdown inside a known memory directory. Claude
+    // Code's memory lives under `~/.claude/projects/<slug>/memory/`; the
+    // `/memory/` component is required so the slug directory's other files
+    // are left alone.
     if is_text {
         let in_claude_memory = path.contains("/.claude/projects/") && path.contains("/memory/");
         let in_other_memory = MEMORY_DIRS[1..].iter().any(|d| path.contains(d));
@@ -143,10 +145,10 @@ mod tests {
 
     #[test]
     fn classifies_memory_files_for_every_agent() {
+        assert_eq!(classify_path("/x/MEMORY.md"), Some(MemoryType::Reference));
         for p in [
-            "/x/MEMORY.md",
             "/Users/q/.claude/projects/-Users-q-Projects-foo/memory/foo.md",
-            "/Users/q/.codex/memories/MEMORY.md",
+            "/Users/q/.codex/memories/memory_summary.md",
             "/Users/q/.codex/memories/rollout_summaries/2026-10-01.md",
             "/Users/q/.codeium/windsurf/memories/project.md",
             "/x/memory-bank/activeContext.md",

@@ -42,6 +42,16 @@ pub fn knowledge_roots() -> Vec<PathBuf> {
     roots
 }
 
+/// The knowledge roots of one agent (by id), e.g. Claude Code's
+/// `~/.claude/projects`. Empty for unknown ids.
+pub fn knowledge_roots_of(agent_id: &str) -> Vec<PathBuf> {
+    registry()
+        .into_iter()
+        .filter(|a| a.id == agent_id)
+        .flat_map(|a| a.knowledge)
+        .collect()
+}
+
 /// What `setup` should do for one agent, given its current state, whether the
 /// user wants it (desired), and whether we're interactive (only interactive
 /// runs are allowed to remove).

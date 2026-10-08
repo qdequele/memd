@@ -764,47 +764,63 @@ pub async fn context(
         facets: Vec::new(),
     };
 
-    // Crawled project files are on disk where the agent already looks; only
-    // inject crawled *memory* files kept outside the project (e.g. another
-    // agent's notes about it). Needs `STARTS WITH`; fall back to "no crawled
-    // docs at all" if the engine rejects it.
-    let rich_filter = if scope == "global" {
-        "source != 'crawler'".to_string()
-    } else {
-        format!(
-            "(source != 'crawler' OR (type IN ['fact', 'agent_instruction'] AND NOT source_path STARTS WITH '{}/'))",
-            scope.replace('\'', "\\'")
-        )
-    };
-    let simple_filter = "source != 'crawler'".to_string();
+    let esc = |s: &str| s.replace('\'', "\\'");
+    // Pass 1: real memories (saved by agents or the user), newest first.
+    // Pass 2: other agents' memory *files* about this project — but never
+    // files inside the project itself (the agent reads those from disk) and
+    // never the calling agent's own memory directory (already in its context).
+    let mut files_filter = vec![
+        "source = 'crawler'".to_string(),
+        "type = 'fact'".to_string(),
+    ];
+    if scope != "global" {
+        files_filter.push(format!("NOT source_path STARTS WITH '{}/'", esc(&scope)));
+    }
+    for root in agent
+        .as_deref()
+        .map(crate::agents::knowledge_roots_of)
+        .unwrap_or_default()
+    {
+        files_filter.push(format!(
+            "NOT source_path STARTS WITH '{}/'",
+            esc(&root.to_string_lossy())
+        ));
+    }
+    let passes = [vec!["source != 'crawler'".to_string()], files_filter];
 
-    let mut result = None;
-    for extra in [rich_filter, simple_filter] {
+    let mut hits = Vec::new();
+    for extra in passes {
+        let remaining = limit.saturating_sub(hits.len());
+        if remaining == 0 {
+            break;
+        }
         let req = GetRequest {
             query: query.clone().unwrap_or_default(),
-            limit: Some(limit),
+            limit: Some(remaining),
             scope: Some(scope.clone()),
-            extra_filters: vec![extra],
+            extra_filters: extra,
             ..Default::default()
         };
         let r = if query.is_some() {
             svc.get(req, &opts).await
         } else {
-            svc.list_with(&req, limit, &opts).await
+            svc.list_with(&req, remaining, &opts).await
         };
         match r {
-            Ok(r) => {
-                result = Some(r);
-                break;
-            }
+            Ok(r) => hits.extend(r.hits),
+            // Older engine without `STARTS WITH`: skip the files pass.
             Err(e) if e.to_string().contains("STARTS WITH") => continue,
             Err(e) => return Err(e),
         }
     }
-    let Some(result) = result else { return Ok(()) };
-    if result.hits.is_empty() {
+    if hits.is_empty() {
         return Ok(());
     }
+    let result = crate::memory::QueryResult {
+        estimated_total: hits.len() as u64,
+        hits,
+        facet_distribution: None,
+    };
 
     let mut out = String::new();
     out.push_str("## Memory (memd)\n");
@@ -840,8 +856,6 @@ pub async fn context(
             ));
         }
     }
-    let _ = agent; // reserved for per-agent phrasing
-
     match format {
         "json" => {
             // Gemini CLI (and any client expecting the hook JSON protocol).
