@@ -64,7 +64,7 @@ git clone https://github.com/qdequele/memd && cd memd
 | 🔍 Meilisearch | Pinned engine downloaded + started as a managed service (no Docker) |
 | 🔌 Agents | Interactive picker — choose from detected agents (Claude Code, Codex, Gemini CLI, Cursor, Windsurf, Cline, Zed); selected ones get memd's MCP server registered |
 | 📝 Directives | Usage block written into agent instruction files (Claude Code, Codex, Gemini CLI) |
-| 🪝 Hooks | SessionStart (ensure daemon + auto-recall) + Stop (auto-capture) wired into Claude Code |
+| 🪝 Hooks | Session-start (ensure daemon + auto-recall) and end-of-turn (auto-capture) hooks wired into Claude Code, Codex, and Gemini CLI |
 | 🎯 Skills | `/memd-doctor` (diagnose & repair) + `/memd-memory` (recall/save playbook) installed for Claude Code |
 
 It's **idempotent** — re-run any time (e.g. after an upgrade) to reconverge.
@@ -77,8 +77,11 @@ It's **idempotent** — re-run any time (e.g. after an upgrade) to reconverge.
 - **🧲 Semantic recall** — hybrid keyword + vector search; embeddings computed locally
   *inside* Meilisearch (nothing leaves your machine).
 - **⏱️ Time-aware & typed** — every memory has timestamps, a type, tags, and a scope.
-- **🐝 Passive ingestion** — a crawler indexes the knowledge already on disk
-  (`README*`, `CLAUDE.md`/`AGENTS.md`, memory files) and keeps it in sync.
+- **🐝 Passive ingestion** — a crawler indexes the knowledge already on disk:
+  `README*`, every agent's instruction files (`CLAUDE.md`, `AGENTS.md`,
+  `GEMINI.md`, `.cursor/rules`, …) **and every agent's own memory files**
+  (Claude Code auto-memory, Codex memories, Windsurf memories, Cline rules) —
+  so what one tool learned, the others can recall.
 - **🪶 Token-safe by design** — search returns lightweight snippets, not blobs; fetch
   the full text only when you ask.
 - **🔒 Local-first** — bound to `127.0.0.1`, local-only key, no cloud by default.
@@ -139,16 +142,20 @@ weakest → strongest (all set up by `memd setup`):
    that compliant clients inject into the model's system prompt.
 2. **Instruction files (cross-tool):** `memd directives install` writes a managed
    block into `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, …
-3. **Harness hooks (deterministic):** a Claude Code **SessionStart** hook injects
-   relevant memories into *every* session; a **Stop** hook auto-captures turns that
-   signal durable intent ("remember…", "we decided…").
+3. **Harness hooks (deterministic):** a **session-start** hook injects the
+   project's memories into *every* session (Claude Code `SessionStart`, Codex
+   `SessionStart`, Gemini CLI `SessionStart`); an **end-of-turn** hook
+   (`Stop` / `AfterAgent`) auto-captures human turns that signal durable intent
+   ("remember…", "we decided…"). Scope is hierarchical: a session in
+   `~/Projects/org/app` sees memories for that repo, for `~/Projects/org`, and
+   `global`.
 
 ---
 
 ## 🛠️ CLI reference
 
 ```
-memd setup [--no-hooks]     One-command install / reconverge
+memd setup [--no-hooks] [--agents a,b]   One-command install / reconverge
 memd up | down              Start / stop the daemon
 memd status                 Daemon + Meilisearch health, index stats, last crawl
 memd logs [-f]              Tail daemon logs
@@ -159,7 +166,7 @@ memd add --file <path> --note "<desc>"        Annotate an important file
 memd search "<query>" [--type --since --semantic-ratio --limit]
 memd forget <id>
 
-memd crawl run|status|config                  Passive ingestion
+memd crawl run [--reset]|status|config        Passive ingestion (--reset rebuilds from scratch)
 memd context [--scope --query --limit]        Print memories as markdown (for hooks)
 memd capture                                  Auto-capture a turn (Stop-hook stdin)
 memd directives install|uninstall            Inject usage directives into agent files
@@ -193,7 +200,7 @@ default_semantic_ratio = 0.5
 
 [crawler]
 roots = ["~/Projects"]
-exclude_dirs = ["node_modules", "target", ".git", "dist", "build", ".next", "…"]
+exclude_dirs = ["node_modules", "target", ".git", ".claude/worktrees", "…"]  # linked git worktrees always skipped
 max_file_bytes = 1000000
 deny_globs = ["**/.env", "**/*.pem", "**/*.key", "…"]   # secrets hygiene
 reconcile_secs = 3600

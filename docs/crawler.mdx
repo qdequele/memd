@@ -1,44 +1,76 @@
 ---
 title: Crawler
-description: "Passive ingestion of meaningful files already on disk."
+description: "Passive ingestion of the knowledge your agents already keep on disk."
 ---
 
 The crawler indexes knowledge that already exists on your machine and keeps it
-in sync — so memories aren't limited to what agents explicitly write.
+in sync — so memories aren't limited to what agents explicitly write. It has
+two jobs: index the instruction files in your projects, and index every
+agent's **own memory files**, so what one tool learned is visible to all the
+others.
 
 ## What it indexes
 
-| Pattern | Mapped type |
-|---------|-------------|
-| `README*` | `project_overview` |
-| `CLAUDE.md`, `AGENTS.md`, `agent.md`, `.cursorrules`, `.github/copilot-instructions.md` | `agent_instruction` |
-| `MEMORY.md`, files under a `memory/` or `.claude/` directory | `fact` |
+| Pattern | Mapped type | Who writes it |
+|---------|-------------|---------------|
+| `README*` | `project_overview` | you |
+| `CLAUDE.md`, `AGENTS.md`, `AGENT.md`, `GEMINI.md`, `.cursorrules`, `.windsurfrules`, `.clinerules`, `.rules`, `.github/copilot-instructions.md` | `agent_instruction` | you, per project |
+| `.cursor/rules/*.mdc`, `.windsurf/rules/*.md`, `.clinerules/*.md`, `.github/instructions/*.md` | `agent_instruction` | you, per project |
+| `~/.claude/projects/<slug>/memory/*.md` | `fact` | Claude Code auto-memory |
+| `~/.codex/memories/**/*.md` | `fact` | Codex built-in memories |
+| `~/.codeium/windsurf/memories/*.md` (+ `global_rules.md`) | `fact` / `agent_instruction` | Windsurf |
+| `~/Documents/Cline/Rules/*.md` | `agent_instruction` | Cline global rules |
+| `memory-bank/*.md`, `MEMORY.md` | `fact` | Cline memory bank, hand-kept notes |
 
-## How it stays in sync
+Everything else is ignored. In particular, ordinary docs (`docs/**`, specs,
+plans) are **not** indexed: they belong to the project, not to memory.
 
-- **Initial scan** of every configured root on startup.
-- **Incremental updates** via a `notify` filesystem watcher (create / modify / remove).
-- **Periodic reconcile** (`reconcile_secs`) to catch missed events.
-- **Deletions** remove the corresponding document.
-- **Stable ids** derived from the file path; a `content_hash` skips re-embedding
-  unchanged files.
+## Roots
+
+- **Project roots** come from `[crawler] roots` (`~/Projects` by default).
+- **Agent knowledge roots** are discovered automatically for every supported
+  agent whose directory exists (`memd crawl config` lists them). They are
+  indexed whether or not memd is wired into that agent.
+
+## What it skips
+
+- Excluded directory names (`node_modules`, `target`, `.git`, …) and path
+  fragments (`.claude/worktrees`, `.cursor/worktrees`).
+- **Any linked git worktree** — a directory whose `.git` is a file. Worktrees
+  are copies of a repository that is already indexed.
+- Files matching the denylist (`**/.env`, `**/*.pem`, `**/*.key`, …) and files
+  larger than `max_file_bytes`.
 
 ## Scope
 
-Each crawled file is scoped to its project directory (the configured root plus
-the first path component below it), enabling project-scoped recall via the
-`scope` filter.
+Each crawled file is scoped to the **git repository** it lives in (the nearest
+ancestor with a `.git` directory, else its own directory). Claude Code memory
+files are scoped to the project their directory slug names; other agents'
+global memories are scoped `global`.
 
-## Secrets hygiene
+Recall is hierarchical: a query scoped to `~/Projects/org/app` matches memories
+scoped to that path, to `~/Projects/org`, to `~/Projects`, to `global`, and to
+any sub-path (a worktree, a nested spec directory).
 
-The crawler skips excluded directories (`node_modules`, `target`, `.git`, …) and
-never indexes files matching the denylist (`**/.env`, `**/*.pem`, `**/*.key`, …).
-Files larger than `max_file_bytes` are skipped.
+## How it stays in sync
+
+- **Initial scan** of every root on startup, loading the crawler's stored
+  state in a few paged requests (no per-file lookups).
+- **Incremental updates** via a `notify` filesystem watcher. Only paths the
+  classifier recognises reach the engine — build artefacts, `.git` internals
+  and editor temp files never generate a task.
+- **Periodic reconcile** (`reconcile_secs`) to catch missed events.
+- **Deletions** remove the corresponding document.
+- **Stable ids** derived from the file path; a `content_hash` skips
+  re-embedding unchanged files.
 
 ## Commands
 
 ```sh
-memd crawl run      # one-off scan
-memd crawl status   # last summary
-memd crawl config   # active configuration
+memd crawl run           # one-off scan
+memd crawl run --reset   # drop every crawled document and rebuild from scratch
+memd crawl status        # last summary
+memd crawl config        # active configuration + discovered agent roots
 ```
+
+Run `--reset` after upgrading from a version with different indexing rules.

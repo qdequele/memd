@@ -326,6 +326,7 @@ pub async fn search(
         since: since_ts,
         until: None,
         semantic_ratio,
+        extra_filters: Vec::new(),
     };
     // CLI shows a plain snippet; disable HTML highlight tags.
     let opts = ProjectionOptions {
@@ -421,11 +422,19 @@ pub async fn history(
 }
 
 /// Run a one-off crawl.
-pub async fn crawl_run() -> Result<()> {
+pub async fn crawl_run(reset: bool) -> Result<()> {
     let cfg = Config::load_or_init()?;
     let svc = require_daemon(&cfg).await?;
-    println!("Crawling {} root(s)...", cfg.crawler.roots.len());
-    let summary = crawler::scan(&cfg, &svc).await?;
+    let knowledge = crate::agents::knowledge_roots();
+    if reset {
+        println!("Dropping every crawled document, then rebuilding…");
+    }
+    println!(
+        "Crawling {} project root(s) + {} agent knowledge root(s)...",
+        cfg.crawler.roots.len(),
+        knowledge.len()
+    );
+    let summary = crawler::scan(&cfg, &svc, reset).await?;
     println!(
         "Done: {} scanned, {} indexed, {} skipped, {} deleted, {} errors.",
         summary.scanned, summary.indexed, summary.skipped, summary.deleted, summary.errors
@@ -453,6 +462,14 @@ pub async fn crawl_config() -> Result<()> {
     println!("Deny globs:   {:?}", cfg.crawler.deny_globs);
     println!("Max bytes:    {}", cfg.crawler.max_file_bytes);
     println!("Reconcile:    every {}s", cfg.crawler.reconcile_secs);
+    let knowledge = crate::agents::knowledge_roots();
+    println!("Agent knowledge roots (always indexed, scoped to their project):");
+    if knowledge.is_empty() {
+        println!("  (none found)");
+    }
+    for k in knowledge {
+        println!("  {}", k.display());
+    }
     Ok(())
 }
 
@@ -507,6 +524,15 @@ pub async fn doctor(fix: bool) -> Result<()> {
             Ok(_) => println!("Index:         memories index reachable"),
             Err(e) => println!("Index:         ERROR — {e} (run `memd up` to configure)"),
         }
+        if fix {
+            // The engine keeps a history of every task; prune anything older
+            // than a week so the task queue stays small.
+            let week_ago = now_secs() - 7 * 86_400;
+            match svc.client().prune_tasks(week_ago).await {
+                Ok(()) => println!("Tasks:         pruned finished tasks older than 7 days"),
+                Err(e) => println!("Tasks:         could not prune — {e}"),
+            }
+        }
     }
     println!(
         "Embedder:      {} / {}",
@@ -532,7 +558,7 @@ pub async fn doctor(fix: bool) -> Result<()> {
 }
 
 /// One-command install. Idempotent: safe to re-run after upgrades.
-pub async fn setup(no_hooks: bool) -> Result<()> {
+pub async fn setup(no_hooks: bool, agents: Option<Vec<String>>) -> Result<()> {
     println!("memd setup\n----------");
 
     // 1. Relocate the binary to a stable path so the service/hooks don't point
@@ -581,7 +607,7 @@ pub async fn setup(no_hooks: bool) -> Result<()> {
     }
 
     // 5–7. Pick agents and converge their memd wiring (MCP + directives + hooks).
-    configure_agents(&installed, &cfg, no_hooks)?;
+    configure_agents(&installed, &cfg, no_hooks, agents)?;
 
     println!(
         "\nmemd is set up. Open a new agent session (or `/hooks` in Claude Code) to activate."
@@ -593,16 +619,39 @@ pub async fn setup(no_hooks: bool) -> Result<()> {
 /// pre-checked with already-configured agents (sync semantics: unchecking a
 /// configured agent removes memd from it). Off a TTY, configure every detected
 /// agent and remove nothing.
-fn configure_agents(installed: &Path, cfg: &Config, no_hooks: bool) -> Result<()> {
+fn configure_agents(
+    installed: &Path,
+    cfg: &Config,
+    no_hooks: bool,
+    explicit: Option<Vec<String>>,
+) -> Result<()> {
     use std::io::IsTerminal;
 
     let agents = crate::agents::registry();
     let statuses: Vec<_> = agents.iter().map(|a| a.status()).collect();
     let url = crate::agents::mcp_url(cfg);
-    let interactive = std::io::stdin().is_terminal();
+    let interactive = std::io::stdin().is_terminal() && explicit.is_none();
 
     // Determine the desired selection (one bool per agent).
-    let desired: Vec<bool> = if interactive {
+    let desired: Vec<bool> = if let Some(ids) = explicit {
+        // Scripted: connect exactly the listed agents; leave the rest alone.
+        for id in &ids {
+            if !agents.iter().any(|a| a.id == id) {
+                bail!(
+                    "unknown agent id `{id}` (expected one of: {})",
+                    agents.iter().map(|a| a.id).collect::<Vec<_>>().join(", ")
+                );
+            }
+        }
+        agents
+            .iter()
+            .zip(&statuses)
+            .map(|(a, s)| {
+                ids.iter().any(|id| id == a.id)
+                    || matches!(s, crate::agents::AgentStatus::Configured)
+            })
+            .collect()
+    } else if interactive {
         let items: Vec<String> = agents
             .iter()
             .zip(&statuses)
@@ -658,12 +707,56 @@ fn configure_agents(installed: &Path, cfg: &Config, no_hooks: bool) -> Result<()
 /// Print relevant memories as markdown, for injection by a SessionStart hook.
 /// Stays silent (and exits 0) if the daemon is down, so it never disrupts a
 /// session start.
-pub async fn context(scope: Option<String>, query: Option<String>, limit: usize) -> Result<()> {
+/// Read the hook payload from stdin when it is piped (hooks always pipe a JSON
+/// object); never block on an interactive terminal.
+fn read_hook_payload() -> Value {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return Value::Null;
+    }
+    let mut input = String::new();
+    let _ = std::io::stdin().read_to_string(&mut input);
+    serde_json::from_str(input.trim()).unwrap_or(Value::Null)
+}
+
+/// Print the memories a new session should start with. Agent-agnostic: every
+/// agent's session-start hook calls this, passing its working directory via
+/// `--scope` or the hook payload's `cwd`.
+///
+/// What gets injected, newest first, within the project's scope chain
+/// (project → parents → global):
+/// - everything agents and the user saved (MCP / CLI), and
+/// - crawled agent memory files that live *outside* the project directory
+///   (another agent's notes about this project), but never files the agent
+///   already reads from the project itself (README, CLAUDE.md, …).
+pub async fn context(
+    scope: Option<String>,
+    agent: Option<String>,
+    format: &str,
+    query: Option<String>,
+    limit: usize,
+) -> Result<()> {
     let cfg = Config::load_or_init()?;
     let svc = MemoryService::from_config(&cfg);
     if !svc.client().is_healthy().await {
         return Ok(());
     }
+    let payload = read_hook_payload();
+    let scope = scope
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            payload
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .map(String::from)
+        })
+        .or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        });
+    let scope = crate::memory::service::normalize_scope(scope.as_deref());
+
     let opts = ProjectionOptions {
         include_content: false,
         crop_length: Some(40),
@@ -671,31 +764,54 @@ pub async fn context(scope: Option<String>, query: Option<String>, limit: usize)
         facets: Vec::new(),
     };
 
-    let result = if let Some(q) = query {
+    // Crawled project files are on disk where the agent already looks; only
+    // inject crawled *memory* files kept outside the project (e.g. another
+    // agent's notes about it). Needs `STARTS WITH`; fall back to "no crawled
+    // docs at all" if the engine rejects it.
+    let rich_filter = if scope == "global" {
+        "source != 'crawler'".to_string()
+    } else {
+        format!(
+            "(source != 'crawler' OR (type IN ['fact', 'agent_instruction'] AND NOT source_path STARTS WITH '{}/'))",
+            scope.replace('\'', "\\'")
+        )
+    };
+    let simple_filter = "source != 'crawler'".to_string();
+
+    let mut result = None;
+    for extra in [rich_filter, simple_filter] {
         let req = GetRequest {
-            query: q,
+            query: query.clone().unwrap_or_default(),
             limit: Some(limit),
-            scope: scope.clone(),
+            scope: Some(scope.clone()),
+            extra_filters: vec![extra],
             ..Default::default()
         };
-        svc.get(req, &opts).await?
-    } else {
-        let mut r = svc.list(None, scope.clone(), limit, 0, &opts).await?;
-        // If nothing is scoped to this project, fall back to recent globals.
-        if r.hits.is_empty() && scope.is_some() {
-            r = svc.list(None, None, limit, 0, &opts).await?;
+        let r = if query.is_some() {
+            svc.get(req, &opts).await
+        } else {
+            svc.list_with(&req, limit, &opts).await
+        };
+        match r {
+            Ok(r) => {
+                result = Some(r);
+                break;
+            }
+            Err(e) if e.to_string().contains("STARTS WITH") => continue,
+            Err(e) => return Err(e),
         }
-        r
-    };
+    }
+    let Some(result) = result else { return Ok(()) };
     if result.hits.is_empty() {
         return Ok(());
     }
 
-    println!("## Memory (memd)");
-    println!(
-        "Relevant long-term memory shared across your LLM tools. Save durable \
-         facts with `save_memory`; call `read_memory(<id>)` for the full text.\n"
-    );
+    let mut out = String::new();
+    out.push_str("## Memory (memd)\n");
+    out.push_str(&format!(
+        "Long-term memory shared across every LLM tool on this machine (scope: `{scope}`). \
+         Save durable facts with `save_memory`; call `read_memory(<id>)` for the full text.\n\n"
+    ));
     for row in &result.hits {
         let ty = row_str(row, "type");
         let title = {
@@ -712,41 +828,88 @@ pub async fn context(scope: Option<String>, query: Option<String>, limit: usize)
             .take(160)
             .collect();
         let id = row_str(row, "id");
+        let origin = match row_str(row, "source").as_str() {
+            "crawler" => " (file)",
+            _ => "",
+        };
         if snippet.is_empty() {
-            println!("- **[{ty}]** {title} `id:{id}`");
+            out.push_str(&format!("- **[{ty}]** {title}{origin} `id:{id}`\n"));
         } else {
-            println!("- **[{ty}]** {title} — {snippet} `id:{id}`");
+            out.push_str(&format!(
+                "- **[{ty}]** {title}{origin} — {snippet} `id:{id}`\n"
+            ));
         }
+    }
+    let _ = agent; // reserved for per-agent phrasing
+
+    match format {
+        "json" => {
+            // Gemini CLI (and any client expecting the hook JSON protocol).
+            let v = serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "SessionStart",
+                    "additionalContext": out,
+                }
+            });
+            println!("{}", serde_json::to_string(&v)?);
+        }
+        _ => print!("{out}"),
     }
     Ok(())
 }
 
-/// Conservatively capture a finished turn from a Claude Code Stop hook. Reads
-/// the hook JSON payload on stdin and only saves when the user's last message
-/// signals durable intent — keeping the store high-signal. Never writes to
-/// stdout (so it adds nothing to the model's context).
-pub async fn capture() -> Result<()> {
-    use std::io::Read;
-    let mut input = String::new();
-    let _ = std::io::stdin().read_to_string(&mut input);
-    let payload: Value = serde_json::from_str(input.trim()).unwrap_or(Value::Null);
+/// The last exchange of a session, as an end-of-turn hook sees it.
+struct Turn {
+    user: String,
+    assistant: Option<String>,
+}
 
-    let Some(transcript_path) = payload.get("transcript_path").and_then(|v| v.as_str()) else {
+/// Pull the final user/assistant exchange out of a hook payload, whichever
+/// agent produced it:
+/// - Gemini CLI `AfterAgent`: `prompt` + `prompt_response` inline;
+/// - Codex `Stop`: `last_assistant_message` + a JSONL transcript;
+/// - Claude Code `Stop`: a JSONL transcript.
+fn turn_from_payload(payload: &Value) -> Option<Turn> {
+    if let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) {
+        return Some(Turn {
+            user: prompt.to_string(),
+            assistant: payload
+                .get("prompt_response")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+        });
+    }
+    let transcript = payload
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    let (user, assistant) = transcript
+        .map(|raw| extract_last_turn(&raw))
+        .unwrap_or((None, None));
+    let assistant = payload
+        .get("last_assistant_message")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .or(assistant);
+    user.map(|user| Turn { user, assistant })
+}
+
+/// Conservatively capture a finished turn. Agent-agnostic: reads whatever
+/// end-of-turn payload the calling agent sends (see [`turn_from_payload`]).
+/// Only a short, human-written message with an explicit durable-intent
+/// phrase ("remember…", "we decided…") is captured.
+pub async fn capture(agent: Option<String>) -> Result<()> {
+    let payload = read_hook_payload();
+    let Some(turn) = turn_from_payload(&payload) else {
         return Ok(());
     };
+    if !is_capturable(&turn.user) {
+        return Ok(()); // high-signal gate
+    }
     let cwd = payload
         .get("cwd")
         .and_then(|v| v.as_str())
         .map(String::from);
-    let Ok(raw) = std::fs::read_to_string(transcript_path) else {
-        return Ok(());
-    };
-
-    let (last_user, last_assistant) = extract_last_turn(&raw);
-    let Some(user) = last_user else { return Ok(()) };
-    if !has_save_intent(&user) {
-        return Ok(()); // high-signal gate
-    }
 
     let cfg = Config::load_or_init()?;
     let svc = MemoryService::from_config(&cfg);
@@ -754,26 +917,48 @@ pub async fn capture() -> Result<()> {
         return Ok(());
     }
 
-    let mut content = format!("User: {}", truncate(&user, 600));
-    if let Some(a) = last_assistant {
-        content.push_str(&format!("\n\nOutcome: {}", truncate(&a, 1200)));
+    let mut content = format!("User: {}", truncate(&turn.user, 600));
+    if let Some(a) = &turn.assistant {
+        content.push_str(&format!("\n\nOutcome: {}", truncate(a, 1200)));
     }
+    let client = agent.unwrap_or_else(|| "unknown-agent".to_string());
     let req = SaveRequest {
         content,
-        title: Some(truncate(&user, 70)),
+        title: Some(truncate(&turn.user, 70)),
         r#type: None,
-        tags: vec!["auto-capture".to_string(), "claude-code".to_string()],
+        tags: vec!["auto-capture".to_string(), client.clone()],
         scope: cwd,
         source: Some(Source::Cli),
         source_path: None,
-        source_client: Some("claude-code".to_string()),
+        source_client: Some(client),
     };
     let id = svc.save(req).await?;
     eprintln!("memd: captured turn -> {id}");
     Ok(())
 }
 
-/// Write the managed memd directive block into known agent instruction files.
+/// The auto-capture gate. Besides the intent phrase, the message must look
+/// like something a person typed: short, and not a system/skill/agent
+/// injection that merely happens to contain the word "remember".
+fn is_capturable(user: &str) -> bool {
+    let t = user.trim();
+    if t.is_empty() || t.chars().count() > 1500 || t.starts_with('<') {
+        return false;
+    }
+    const INJECTED: &[&str] = &[
+        "<system-reminder",
+        "<agent-message",
+        "<command-name",
+        "Base directory for this skill",
+        "[Subagent hand-back]",
+        "<task-notification",
+    ];
+    if INJECTED.iter().any(|m| t.contains(m)) {
+        return false;
+    }
+    has_save_intent(t)
+}
+
 pub fn directives_install() -> Result<()> {
     crate::agents::directives_install_all()
 }
@@ -875,7 +1060,15 @@ fn extract_last_turn(jsonl: &str) -> (Option<String>, Option<String>) {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let msg = v.get("message").unwrap_or(&v);
+        // Claude Code wraps the message in `message`; Codex rollouts in
+        // `payload`; others put role/content at the top level.
+        let msg = v.get("message").or_else(|| v.get("payload")).unwrap_or(&v);
+        // Injected context (skill loads, hook output) and subagent threads are
+        // not the human's words.
+        let flagged = |k: &str| v.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+        if flagged("isMeta") || flagged("isSidechain") {
+            continue;
+        }
         let role = msg
             .get("role")
             .and_then(|r| r.as_str())
@@ -893,12 +1086,19 @@ fn extract_last_turn(jsonl: &str) -> (Option<String>, Option<String>) {
     (last_user, last_assistant)
 }
 
-/// Flatten MCP/Anthropic message content (string or array of text blocks).
+/// Text of a message: a plain string, or the text blocks of a content array.
+/// Tool results are skipped — they are the tool's output, not the user's.
 fn extract_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Array(arr)) => arr
             .iter()
+            .filter(|b| {
+                !matches!(
+                    b.get("type").and_then(|t| t.as_str()),
+                    Some("tool_result") | Some("tool_use") | Some("function_call")
+                )
+            })
             .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
             .collect::<Vec<_>>()
             .join(" "),
@@ -906,7 +1106,6 @@ fn extract_text(content: Option<&Value>) -> String {
     }
 }
 
-/// True if a message signals durable memory intent (the auto-capture gate).
 fn has_save_intent(s: &str) -> bool {
     let l = s.to_lowercase();
     const SIGNALS: &[&str] = &[
@@ -1149,6 +1348,52 @@ async fn restart_service(cfg: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_gate_rejects_injected_context() {
+        assert!(is_capturable("remember that we deploy on Fridays"));
+        assert!(is_capturable("We decided to use Postgres for billing."));
+        assert!(!is_capturable("what time is it"));
+        assert!(!is_capturable(
+            "Base directory for this skill: /x/skills/tdd\n# TDD\nRemember to write tests first"
+        ));
+        assert!(!is_capturable(
+            "<agent-message from=\"abc\">[Subagent hand-back] remember this</agent-message>"
+        ));
+        let long = format!("remember {}", "x".repeat(2000));
+        assert!(!is_capturable(&long));
+    }
+
+    #[test]
+    fn turn_from_gemini_and_codex_payloads() {
+        let gemini = serde_json::json!({ "prompt": "remember X", "prompt_response": "ok" });
+        let t = turn_from_payload(&gemini).unwrap();
+        assert_eq!(t.user, "remember X");
+        assert_eq!(t.assistant.as_deref(), Some("ok"));
+
+        let codex = serde_json::json!({ "last_assistant_message": "done", "transcript_path": "/nonexistent" });
+        assert!(
+            turn_from_payload(&codex).is_none(),
+            "no user turn without a transcript"
+        );
+    }
+
+    #[test]
+    fn extract_last_turn_handles_claude_and_codex_formats() {
+        let claude = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"remember A"}]}}
+{"type":"user","isMeta":true,"message":{"role":"user","content":"Base directory for this skill"}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"sure"}]}}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"remember B"}]}}"#;
+        let (u, a) = extract_last_turn(claude);
+        assert_eq!(u.as_deref(), Some("remember A"));
+        assert_eq!(a.as_deref(), Some("sure"));
+
+        let codex = r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"we decided C"}]}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"noted"}]}}"#;
+        let (u, a) = extract_last_turn(codex);
+        assert_eq!(u.as_deref(), Some("we decided C"));
+        assert_eq!(a.as_deref(), Some("noted"));
+    }
 
     #[test]
     fn up_reports_already_running_only_when_fully_healthy() {
