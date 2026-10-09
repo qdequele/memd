@@ -10,6 +10,10 @@ mod config;
 mod crawler;
 mod daemon;
 mod history;
+// Built up across several tasks; the allow is removed once every item is wired
+// into the CLI and MCP server (Task 10).
+#[allow(dead_code)]
+mod knowledge;
 mod launchd;
 mod logging;
 mod mcp;
