@@ -3,6 +3,9 @@
 //! hint when the daemon is down.
 
 use crate::config::Config;
+use crate::knowledge::KnowledgeService;
+use crate::knowledge::ident::key_of;
+use crate::knowledge::relations::Relation;
 use crate::memory::model::now_secs;
 use crate::memory::{
     GetRequest, MemoryService, MemoryType, ProjectionOptions, SaveRequest, Source,
@@ -10,6 +13,7 @@ use crate::memory::{
 use crate::{crawler, launchd, meili, paths};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -300,15 +304,32 @@ pub async fn add(
 }
 
 /// Search memories and print ranked results.
+#[allow(clippy::too_many_arguments)]
 pub async fn search(
     query: String,
     ty: Option<String>,
     since: Option<String>,
     semantic_ratio: Option<f32>,
     limit: usize,
+    entity: Option<String>,
+    status: Option<String>,
+    kind_of: Option<String>,
 ) -> Result<()> {
     let cfg = Config::load_or_init()?;
     let svc = require_daemon(&cfg).await?;
+
+    let entity = match entity {
+        Some(n) => match crate::knowledge::resolve::resolve(&svc, &n, None).await? {
+            crate::knowledge::resolve::Resolution::Found(id) => Some(id),
+            crate::knowledge::resolve::Resolution::NotFound => {
+                Some(crate::knowledge::ident::entity_id(&n)?)
+            }
+            crate::knowledge::resolve::Resolution::Ambiguous(c) => {
+                bail!(crate::knowledge::resolve::ambiguity_message(&n, &c))
+            }
+        },
+        None => None,
+    };
 
     let parsed_type = match &ty {
         Some(s) => Some(MemoryType::parse(s).ok_or_else(|| anyhow::anyhow!("unknown type: {s}"))?),
@@ -329,9 +350,9 @@ pub async fn search(
         until: None,
         semantic_ratio,
         extra_filters: Vec::new(),
-        entity: None,
-        status: None,
-        kind_of: None,
+        entity,
+        status,
+        kind_of,
     };
     // CLI shows a plain snippet; disable HTML highlight tags.
     let opts = ProjectionOptions {
@@ -536,6 +557,13 @@ pub async fn doctor(fix: bool) -> Result<()> {
             match svc.client().prune_tasks(week_ago).await {
                 Ok(()) => println!("Tasks:         pruned finished tasks older than 7 days"),
                 Err(e) => println!("Tasks:         could not prune — {e}"),
+            }
+            match KnowledgeService::new(svc.clone())
+                .backfill_project_links()
+                .await
+            {
+                Ok(n) => println!("Links:         linked {n} memories to their project entity"),
+                Err(e) => println!("Links:         back-fill failed — {e}"),
             }
         }
     }
@@ -761,6 +789,8 @@ pub async fn context(
                 .map(|p| p.to_string_lossy().to_string())
         });
     let scope = crate::memory::service::normalize_scope(scope.as_deref());
+    let kn = KnowledgeService::new(svc.clone());
+    let header = project_header(&kn, &scope).await.unwrap_or(None);
 
     let opts = ProjectionOptions {
         include_content: false,
@@ -818,7 +848,7 @@ pub async fn context(
             Err(e) => return Err(e),
         }
     }
-    if hits.is_empty() {
+    if hits.is_empty() && header.is_none() {
         return Ok(());
     }
     let result = crate::memory::QueryResult {
@@ -833,6 +863,10 @@ pub async fn context(
         "Long-term memory shared across every LLM tool on this machine (scope: `{scope}`). \
          Save durable facts with `save_memory`; call `read_memory(<id>)` for the full text.\n\n"
     ));
+    if let Some(h) = &header {
+        out.push_str(h);
+        out.push_str("\n\n");
+    }
     for row in &result.hits {
         let ty = row_str(row, "type");
         let title = {
@@ -874,6 +908,269 @@ pub async fn context(
         }
         _ => print!("{out}"),
     }
+    Ok(())
+}
+
+/// One block about the current project, printed before the session's
+/// memories. Silent for crawled projects nobody has described yet.
+fn context_header(
+    entity: &crate::memory::MemoryItem,
+    outgoing: &[Relation],
+    incoming: &[Relation],
+    names: &HashMap<String, String>,
+) -> Option<String> {
+    if outgoing.is_empty() && incoming.is_empty() && entity.source == "crawler" {
+        return None;
+    }
+    let name_of = |id: &str| {
+        names
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| key_of(id).to_string())
+    };
+    let note = |n: &Option<String>| {
+        n.as_ref()
+            .map(|n| format!(" ({})", truncate(n, 60)))
+            .unwrap_or_default()
+    };
+    let k = &entity.knowledge;
+    let mut parts = vec![k.kind_of.clone().unwrap_or_else(|| "entity".into())];
+    if let Some(o) = &k.owner {
+        parts.push(format!("owner: {}", name_of(o)));
+    }
+    parts.push(format!(
+        "status: {}",
+        k.status.as_deref().unwrap_or("active")
+    ));
+    let title = k
+        .name
+        .clone()
+        .unwrap_or_else(|| key_of(&entity.id).to_string());
+    let mut out = format!("**{title}** — {}", parts.join(" · "));
+    let rels: Vec<String> = outgoing
+        .iter()
+        .map(|r| format!("{} → {}{}", r.predicate, name_of(&r.object), note(&r.note)))
+        .chain(incoming.iter().map(|r| {
+            format!(
+                "{} {} → {title}{}",
+                name_of(&r.subject),
+                r.predicate,
+                note(&r.note)
+            )
+        }))
+        .take(8)
+        .collect();
+    if !rels.is_empty() {
+        out.push_str("\n  ");
+        out.push_str(&rels.join(" · "));
+    }
+    Some(out)
+}
+
+/// Markdown for an `explore` response.
+fn render_explore(v: &Value) -> String {
+    let s = |o: &Value, k: &str| o.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let entity = &v["entity"];
+    if entity.is_null() {
+        let mut out = "No entity by that name.".to_string();
+        if let Some(sugg) = v["suggestions"].as_array().filter(|a| !a.is_empty()) {
+            out.push_str(" Did you mean:\n");
+            for h in sugg {
+                out.push_str(&format!("- {} `{}`\n", s(h, "title"), s(h, "id")));
+            }
+        }
+        return out;
+    }
+    let mut out = format!("## {} ({}", s(entity, "name"), s(entity, "kind_of"));
+    let status = s(entity, "status");
+    if !status.is_empty() {
+        out.push_str(&format!(", {status}"));
+    }
+    out.push_str(&format!(")  `{}`\n", s(entity, "id")));
+    let summary = s(entity, "summary");
+    if !summary.is_empty() {
+        out.push_str(&format!("{summary}\n"));
+    }
+    if let Some(a) = entity["aliases_display"]
+        .as_array()
+        .filter(|a| !a.is_empty())
+    {
+        let list: Vec<&str> = a.iter().filter_map(|x| x.as_str()).collect();
+        out.push_str(&format!("Aliases: {}\n", list.join(", ")));
+    }
+    let note = |e: &Value| {
+        let n = s(e, "note");
+        if n.is_empty() {
+            String::new()
+        } else {
+            format!(" — {n}")
+        }
+    };
+    let out_edges = v["outgoing"].as_array().cloned().unwrap_or_default();
+    let in_edges = v["incoming"].as_array().cloned().unwrap_or_default();
+    if !out_edges.is_empty() || !in_edges.is_empty() {
+        out.push_str("\n### Relations\n");
+        for e in &out_edges {
+            out.push_str(&format!(
+                "- {} → {}{}\n",
+                s(e, "predicate"),
+                s(e, "name"),
+                note(e)
+            ));
+        }
+        for e in &in_edges {
+            out.push_str(&format!(
+                "- {} {} → {}{}\n",
+                s(e, "name"),
+                s(e, "predicate"),
+                s(entity, "name"),
+                note(e)
+            ));
+        }
+    }
+    if let Some(mems) = v["memories"].as_array().filter(|a| !a.is_empty()) {
+        out.push_str("\n### Memories\n");
+        for m in mems {
+            let snippet: String = s(m, "content")
+                .replace('\n', " ")
+                .chars()
+                .take(160)
+                .collect();
+            out.push_str(&format!(
+                "- [{}] {} — {} `id:{}`\n",
+                s(m, "type"),
+                s(m, "title"),
+                snippet,
+                s(m, "id")
+            ));
+        }
+    }
+    out
+}
+
+/// The current project's header block, if the scope belongs to one.
+async fn project_header(kn: &KnowledgeService, scope: &str) -> Result<Option<String>> {
+    let Some(id) = kn.project_for_scope(scope).await? else {
+        return Ok(None);
+    };
+    let Some(entity) = kn.memories().get_item(&id).await? else {
+        return Ok(None);
+    };
+    let one = std::slice::from_ref(&id);
+    let outgoing = kn.relations().by_subjects(one).await?;
+    let incoming = kn.relations().by_objects(one).await?;
+    let mut ids: Vec<String> = outgoing
+        .iter()
+        .map(|r| r.object.clone())
+        .chain(incoming.iter().map(|r| r.subject.clone()))
+        .chain(entity.knowledge.owner.clone())
+        .collect();
+    ids.sort();
+    ids.dedup();
+    let names: HashMap<String, String> = if ids.is_empty() {
+        HashMap::new()
+    } else {
+        kn.memories()
+            .client()
+            .fetch_docs(
+                &crate::knowledge::ident::in_filter("id", &ids),
+                &["id", "name"],
+            )
+            .await?
+            .into_iter()
+            .filter_map(|d| {
+                Some((
+                    d.get("id")?.as_str()?.to_string(),
+                    d.get("name")?.as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    };
+    Ok(context_header(&entity, &outgoing, &incoming, &names))
+}
+
+pub async fn entity_show(name: String, depth: u8) -> Result<()> {
+    let cfg = Config::load_or_init()?;
+    let kn = KnowledgeService::new(require_daemon(&cfg).await?);
+    let scope = std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().to_string());
+    let v = kn.explore(&name, depth, 10, scope.as_deref()).await?;
+    print!("{}", render_explore(&v));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn entity_add(
+    name: String,
+    kind: String,
+    description: Option<String>,
+    aliases: Vec<String>,
+    owner: Option<String>,
+    status: Option<String>,
+    url: Option<String>,
+    scope: Option<String>,
+) -> Result<()> {
+    let cfg = Config::load_or_init()?;
+    let kn = KnowledgeService::new(require_daemon(&cfg).await?);
+    let mut input = crate::knowledge::service::EntityInput::new(&name, &kind, Source::Cli);
+    input.description = description;
+    input.aliases = aliases;
+    input.owner = owner;
+    input.status = status;
+    input.url = url;
+    input.scope = scope;
+    input.source_client = Some("cli".into());
+    let out = kn.save_entity(input).await?;
+    println!(
+        "{} {}",
+        if out.created { "Created" } else { "Updated" },
+        out.id
+    );
+    for w in out.warnings {
+        println!("⚠ {w}");
+    }
+    Ok(())
+}
+
+pub async fn relate(
+    subject: String,
+    predicate: String,
+    object: String,
+    note: Option<String>,
+) -> Result<()> {
+    let cfg = Config::load_or_init()?;
+    let kn = KnowledgeService::new(require_daemon(&cfg).await?);
+    let rel = crate::knowledge::service::RelationInput {
+        subject: Some(subject),
+        predicate,
+        object,
+        note,
+    };
+    let warnings = kn
+        .relate(&[rel], "global", Source::Cli, Some("cli".into()))
+        .await;
+    if warnings.is_empty() {
+        println!("Related.");
+    }
+    for w in warnings {
+        println!("⚠ {w}");
+    }
+    Ok(())
+}
+
+pub async fn unrelate(subject: String, predicate: String, object: String) -> Result<()> {
+    let cfg = Config::load_or_init()?;
+    let kn = KnowledgeService::new(require_daemon(&cfg).await?);
+    let deleted = kn.forget_relation(&subject, &predicate, &object).await?;
+    println!(
+        "{}",
+        if deleted {
+            "Removed."
+        } else {
+            "No such relation."
+        }
+    );
     Ok(())
 }
 
@@ -1368,6 +1665,113 @@ async fn restart_service(cfg: &Config) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::knowledge::relations::Relation;
+    use std::collections::HashMap;
+
+    fn rel(s: &str, p: &str, o: &str, note: Option<&str>) -> Relation {
+        Relation::new(
+            s,
+            p,
+            o,
+            note.map(String::from),
+            Source::Mcp,
+            None,
+            "global",
+            1,
+        )
+        .unwrap()
+    }
+
+    fn entity(source: &str) -> crate::memory::MemoryItem {
+        let mut e = crate::knowledge::service::build_entity(
+            "entity_memd",
+            None,
+            &crate::knowledge::service::EntityInput::new("memd", "project", Source::Mcp),
+            Some("entity_quentin".into()),
+            1,
+        )
+        .unwrap()
+        .item;
+        e.source = source.into();
+        e
+    }
+
+    #[test]
+    fn context_header_lists_kind_owner_status_and_relations() {
+        let names = HashMap::from([
+            ("entity_quentin".to_string(), "Quentin".to_string()),
+            (
+                "entity_side".to_string(),
+                "Meilisearch side projects".to_string(),
+            ),
+            ("entity_meili".to_string(), "Meilisearch".to_string()),
+        ]);
+        let out = [
+            rel("entity_memd", "part_of", "entity_side", None),
+            rel(
+                "entity_memd",
+                "uses",
+                "entity_meili",
+                Some("local engine, pinned"),
+            ),
+        ];
+        let h = context_header(&entity("mcp"), &out, &[], &names).unwrap();
+        assert!(
+            h.starts_with("**memd** — project · owner: Quentin · status: active"),
+            "{h}"
+        );
+        assert!(h.contains("part_of → Meilisearch side projects"), "{h}");
+        assert!(
+            h.contains("uses → Meilisearch (local engine, pinned)"),
+            "{h}"
+        );
+    }
+
+    #[test]
+    fn context_header_is_silent_for_undescribed_crawled_projects() {
+        assert!(context_header(&entity("crawler"), &[], &[], &HashMap::new()).is_none());
+        assert!(context_header(&entity("mcp"), &[], &[], &HashMap::new()).is_some());
+    }
+
+    #[test]
+    fn context_header_caps_relations_and_notes() {
+        let out: Vec<Relation> = (0..12)
+            .map(|i| {
+                rel(
+                    "entity_memd",
+                    "uses",
+                    &format!("entity_t{i}"),
+                    Some(&"n".repeat(100)),
+                )
+            })
+            .collect();
+        let h = context_header(&entity("mcp"), &out, &[], &HashMap::new()).unwrap();
+        assert_eq!(h.matches("uses →").count(), 8);
+        assert!(!h.contains(&"n".repeat(61)));
+    }
+
+    #[test]
+    fn render_explore_prints_entity_relations_and_memories() {
+        let v = serde_json::json!({
+            "entity": { "id": "entity_lumen", "name": "Lumen", "kind_of": "product", "summary": "Gateway.", "aliases_display": ["lumen-gw"] },
+            "outgoing": [{ "predicate": "part_of", "object": "entity_lab", "name": "Lab", "note": "data plane" }],
+            "incoming": [{ "predicate": "depends_on", "subject": "entity_glutony", "name": "glutony" }],
+            "related": [],
+            "memories": [{ "id": "m1", "type": "decision", "title": "Use leases", "content": "Leases…" }]
+        });
+        let s = render_explore(&v);
+        assert!(s.contains("## Lumen (product)"), "{s}");
+        assert!(s.contains("Gateway."));
+        assert!(s.contains("Aliases: lumen-gw"));
+        assert!(s.contains("- part_of → Lab — data plane"));
+        assert!(s.contains("- glutony depends_on → Lumen"));
+        assert!(s.contains("[decision] Use leases"));
+        let none = render_explore(
+            &serde_json::json!({ "entity": null, "suggestions": [{ "id": "entity_lab", "title": "Lab" }] }),
+        );
+        assert!(none.contains("No entity") && none.contains("Lab"), "{none}");
+    }
 
     #[test]
     fn capture_gate_rejects_injected_context() {

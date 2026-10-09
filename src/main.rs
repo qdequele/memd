@@ -10,9 +10,6 @@ mod config;
 mod crawler;
 mod daemon;
 mod history;
-// Built up across several tasks; the allow is removed once every item is wired
-// into the CLI and MCP server (Task 10).
-#[allow(dead_code)]
 mod knowledge;
 mod launchd;
 mod logging;
@@ -22,7 +19,7 @@ mod memory;
 mod paths;
 mod update;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 /// memd — universal local memory daemon for LLMs, backed by Meilisearch.
 #[derive(Parser)]
@@ -93,6 +90,32 @@ enum Command {
         /// Maximum number of results.
         #[arg(long, default_value_t = 10)]
         limit: usize,
+        /// Only memories that mention this entity (name or id).
+        #[arg(long)]
+        entity: Option<String>,
+        /// Only records with this status.
+        #[arg(long)]
+        status: Option<String>,
+        /// Only entities of this kind.
+        #[arg(long = "kind-of")]
+        kind_of: Option<String>,
+    },
+    /// Show what memd knows about an entity, or add one (`memd entity add`).
+    Entity(EntityArgs),
+    /// Declare a relation: `memd relate "Lumen" part_of "Meilisearch Lab"`.
+    Relate {
+        subject: String,
+        predicate: String,
+        object: String,
+        /// Optional note on the relation.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Remove a relation.
+    Unrelate {
+        subject: String,
+        predicate: String,
+        object: String,
     },
     /// Forget (delete) a memory by id.
     Forget {
@@ -198,6 +221,41 @@ enum Command {
     },
 }
 
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct EntityArgs {
+    #[command(subcommand)]
+    action: Option<EntityAction>,
+    /// Entity name, alias or id.
+    name: Option<String>,
+    /// 1, or 2 to include the neighbours' relations.
+    #[arg(long, default_value_t = 1)]
+    depth: u8,
+}
+
+#[derive(Subcommand)]
+enum EntityAction {
+    /// Create or update an entity.
+    Add {
+        name: String,
+        /// company, team, person, project, product, service, customer, concept.
+        #[arg(long)]
+        kind: String,
+        #[arg(long = "desc")]
+        description: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        alias: Vec<String>,
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        status: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum CrawlAction {
     /// Run a one-off crawl of the configured roots.
@@ -261,7 +319,51 @@ async fn main() -> anyhow::Result<()> {
             since,
             semantic_ratio,
             limit,
-        } => cli::search(query, r#type, since, semantic_ratio, limit).await,
+            entity,
+            status,
+            kind_of,
+        } => {
+            cli::search(
+                query,
+                r#type,
+                since,
+                semantic_ratio,
+                limit,
+                entity,
+                status,
+                kind_of,
+            )
+            .await
+        }
+        Command::Entity(args) => match args.action {
+            Some(EntityAction::Add {
+                name,
+                kind,
+                description,
+                alias,
+                owner,
+                status,
+                url,
+                scope,
+            }) => cli::entity_add(name, kind, description, alias, owner, status, url, scope).await,
+            None => match args.name {
+                Some(name) => cli::entity_show(name, args.depth).await,
+                None => anyhow::bail!(
+                    "usage: memd entity <name> | memd entity add <name> --kind <kind>"
+                ),
+            },
+        },
+        Command::Relate {
+            subject,
+            predicate,
+            object,
+            note,
+        } => cli::relate(subject, predicate, object, note).await,
+        Command::Unrelate {
+            subject,
+            predicate,
+            object,
+        } => cli::unrelate(subject, predicate, object).await,
         Command::Forget { id } => cli::forget(id).await,
         Command::History {
             action,
