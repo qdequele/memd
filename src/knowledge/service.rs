@@ -12,7 +12,7 @@ use crate::history::{EventAction, MemoryEvent};
 use crate::memory::model::now_secs;
 use crate::memory::service::{content_hash, normalize_scope};
 use crate::memory::{GetRequest, MemoryType, ProjectionOptions};
-use crate::memory::{Knowledge, MemoryItem, MemoryService, Source};
+use crate::memory::{Knowledge, MemoryItem, MemoryService, SaveRequest, Source};
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
@@ -193,6 +193,46 @@ pub fn build_entity(
         created,
         warnings,
     })
+}
+
+/// The project whose directory contains `scope` most closely.
+pub fn longest_path_match(scope: &str, projects: &[(String, String)]) -> Option<String> {
+    projects
+        .iter()
+        .filter(|(_, p)| scope == p || scope.starts_with(&format!("{p}/")))
+        .max_by_key(|(_, p)| p.len())
+        .map(|(id, _)| id.clone())
+}
+
+/// PUT patches adding the matching project entity to memories that lack it.
+pub fn backfill_patches(docs: &[Value], projects: &[(String, String)]) -> Vec<Value> {
+    docs.iter()
+        .filter_map(|d| {
+            let id = d.get("id")?.as_str()?;
+            let scope = d.get("scope")?.as_str()?;
+            let project = longest_path_match(scope, projects)?;
+            let mut entities: Vec<String> = d
+                .get("entities")
+                .and_then(|e| e.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if entities.contains(&project) {
+                return None;
+            }
+            entities.push(project);
+            Some(json!({ "id": id, "entities": entities }))
+        })
+        .collect()
+}
+
+fn push_unique(v: &mut Vec<String>, id: String) {
+    if !v.contains(&id) {
+        v.push(id);
+    }
 }
 
 /// Entities, relations, and their links to memories.
@@ -442,6 +482,129 @@ impl KnowledgeService {
         ))
     }
 
+    /// Every project entity with a directory: `(id, path)`.
+    pub async fn project_entities(&self) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .mem
+            .client()
+            .fetch_docs("type = 'entity' AND kind_of = 'project'", &["id", "path"])
+            .await?
+            .into_iter()
+            .filter_map(|d| {
+                Some((
+                    d.get("id")?.as_str()?.to_string(),
+                    d.get("path")?.as_str()?.to_string(),
+                ))
+            })
+            .collect())
+    }
+
+    /// The project entity a scope belongs to, if any.
+    pub async fn project_for_scope(&self, scope: &str) -> Result<Option<String>> {
+        if scope == "global" {
+            return Ok(None);
+        }
+        Ok(longest_path_match(scope, &self.project_entities().await?))
+    }
+
+    async fn resolve_names(
+        &self,
+        names: &[String],
+        scope: &str,
+        source: Source,
+        client: Option<String>,
+        into: &mut Vec<String>,
+        warnings: &mut Vec<String>,
+    ) {
+        for n in names {
+            match self.resolve_or_stub(n, scope, source, client.clone()).await {
+                Ok(id) => push_unique(into, id),
+                Err(e) => warnings.push(format!("entity `{n}` skipped: {e}")),
+            }
+        }
+    }
+
+    /// Save a memory with its entity mentions and relations. The project its
+    /// scope belongs to is linked automatically.
+    pub async fn save_memory(
+        &self,
+        mut req: SaveRequest,
+        entity_names: &[String],
+        relations: &[RelationInput],
+    ) -> Result<(String, Vec<String>)> {
+        let source = req.source.unwrap_or(Source::Cli);
+        let client = req.source_client.clone();
+        let scope = normalize_scope(req.scope.as_deref());
+        let mut warnings = Vec::new();
+        let mut ids = std::mem::take(&mut req.entities);
+        self.resolve_names(
+            entity_names,
+            &scope,
+            source,
+            client.clone(),
+            &mut ids,
+            &mut warnings,
+        )
+        .await;
+        if let Ok(Some(project)) = self.project_for_scope(&scope).await {
+            push_unique(&mut ids, project);
+        }
+        req.entities = ids;
+        let id = self.mem.save(req).await?;
+        warnings.extend(self.relate(relations, &scope, source, client).await);
+        Ok((id, warnings))
+    }
+
+    /// Add entity mentions and relations to an existing memory.
+    pub async fn link_existing(
+        &self,
+        id: &str,
+        entity_names: &[String],
+        relations: &[RelationInput],
+        source: Source,
+        client: Option<String>,
+    ) -> Result<Vec<String>> {
+        let item = self
+            .mem
+            .get_item(id)
+            .await?
+            .ok_or_else(|| anyhow!("no memory with id {id}"))?;
+        let mut warnings = Vec::new();
+        let mut entities = item.knowledge.entities.clone();
+        self.resolve_names(
+            entity_names,
+            &item.scope,
+            source,
+            client.clone(),
+            &mut entities,
+            &mut warnings,
+        )
+        .await;
+        if entities != item.knowledge.entities {
+            self.mem
+                .patch(&[json!({ "id": id, "entities": entities })])
+                .await?;
+        }
+        warnings.extend(self.relate(relations, &item.scope, source, client).await);
+        Ok(warnings)
+    }
+
+    /// One-time link of existing agent/user memories to their project entity.
+    pub async fn backfill_project_links(&self) -> Result<usize> {
+        let projects = self.project_entities().await?;
+        let docs = self
+            .mem
+            .client()
+            .fetch_docs(
+                "source != 'crawler' AND type != 'entity'",
+                &["id", "scope", "entities"],
+            )
+            .await?;
+        let patches = backfill_patches(&docs, &projects);
+        self.mem.patch(&patches).await?;
+        Ok(patches.len())
+    }
+
     /// Delete one relation, by names or ids. Unknown endpoints mean there is
     /// nothing to delete.
     pub async fn forget_relation(
@@ -636,5 +799,57 @@ mod tests {
         assert_eq!(it.knowledge.path.as_deref(), Some("/p/memd"), "path kept");
         assert_eq!(Source::parse(&c.source), Some(Source::Crawler));
         assert_eq!(Source::parse("nope"), None);
+    }
+
+    #[test]
+    fn longest_path_match_picks_the_nearest_project() {
+        let projects = vec![
+            (
+                "entity_meilisearch".to_string(),
+                "/p/meilisearch".to_string(),
+            ),
+            ("entity_memd".to_string(), "/p/side/memd".to_string()),
+            ("entity_side".to_string(), "/p/side".to_string()),
+        ];
+        assert_eq!(
+            longest_path_match("/p/side/memd", &projects).as_deref(),
+            Some("entity_memd")
+        );
+        assert_eq!(
+            longest_path_match("/p/side/memd/crates/x", &projects).as_deref(),
+            Some("entity_memd")
+        );
+        assert_eq!(
+            longest_path_match("/p/side/other", &projects).as_deref(),
+            Some("entity_side")
+        );
+        // A sibling that merely shares a prefix is not a match.
+        assert_eq!(
+            longest_path_match("/p/side/memd2", &projects).as_deref(),
+            Some("entity_side")
+        );
+        assert_eq!(longest_path_match("/q", &projects), None);
+        assert_eq!(longest_path_match("global", &projects), None);
+    }
+
+    #[test]
+    fn backfill_only_patches_unlinked_memories_in_a_project() {
+        let projects = vec![("entity_memd".to_string(), "/p/memd".to_string())];
+        let docs = vec![
+            serde_json::json!({ "id": "a", "scope": "/p/memd" }),
+            serde_json::json!({ "id": "b", "scope": "/p/memd", "entities": ["entity_memd"] }),
+            serde_json::json!({ "id": "c", "scope": "/p/memd", "entities": ["entity_x"] }),
+            serde_json::json!({ "id": "d", "scope": "global" }),
+        ];
+        let patches = backfill_patches(&docs, &projects);
+        assert_eq!(patches.len(), 2);
+        assert_eq!(
+            patches[0],
+            serde_json::json!({ "id": "a", "entities": ["entity_memd"] })
+        );
+        assert_eq!(
+            patches[1],
+            serde_json::json!({ "id": "c", "entities": ["entity_x", "entity_memd"] })
+        );
     }
 }

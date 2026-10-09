@@ -356,7 +356,6 @@ impl MemoryService {
     }
 
     /// Merge partial documents into existing ones (`PUT`).
-    #[allow(dead_code)] // first caller: Task 7; removed there
     pub async fn patch(&self, patches: &[Value]) -> Result<()> {
         if patches.is_empty() {
             return Ok(());
