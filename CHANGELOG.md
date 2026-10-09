@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.4.0](https://github.com/qdequele/memd/compare/v0.3.0...v0.4.0) (2026-10-09)
+
+
+### Features
+
+* **agents:** ship memd skills + a self-healing SessionStart hook ([c7aefb3](https://github.com/qdequele/memd/commit/c7aefb3cdd4e9f9d30a74ec6554a450da4498640))
+* **agents:** ship memd skills + a self-healing SessionStart hook ([1159449](https://github.com/qdequele/memd/commit/11594495e828381f7dcf1a39f632482cb3ea0f12))
+* **cli:** entity, relate, unrelate, entity filters, project header, back-fill ([9f646f0](https://github.com/qdequele/memd/commit/9f646f07ba63c4cb8aa202ab0950fc8ef28bd532))
+* **crawler:** project entities from git repositories, linked crawled files ([4e465ce](https://github.com/qdequele/memd/commit/4e465ce9997bd11a652494f6718e77a14db066a4))
+* **knowledge:** explore an entity's relations, neighbours and memories ([4ffd377](https://github.com/qdequele/memd/commit/4ffd377938ad3b440241685c586c0991c168d3ca))
+* **knowledge:** id-first name resolution with scoped alias tie-break ([2bfcb5b](https://github.com/qdequele/memd/commit/2bfcb5bc5cb9997bc5c465f50f53bed4eddb217d))
+* **knowledge:** identity primitives for entities and relations ([f570fc0](https://github.com/qdequele/memd/commit/f570fc0c2c391242633327e34d015aafd5c04f2d))
+* **knowledge:** link memories to mentioned entities and their project ([fab36dc](https://github.com/qdequele/memd/commit/fab36dc31d7896317b6c7ccdc1395ac5cce38f3f))
+* **knowledge:** memory_relations index, relation store and events ([2f6e58c](https://github.com/qdequele/memd/commit/2f6e58ca02a11adfb23b87077db674a91b12ff72))
+* **knowledge:** save entities with merge semantics, relate, forget relations ([24f93f0](https://github.com/qdequele/memd/commit/24f93f0f9e444e62cf9a169f24f7b112a191bec8))
+* **mcp:** save_entity, explore, forget_relation; entity filters and links ([def4120](https://github.com/qdequele/memd/commit/def41209d55c31c79cc2fcef8564b7e765f4df6a))
+* **memory:** knowledge fields, entity type, entity/status/kind filters ([560b149](https://github.com/qdequele/memd/commit/560b1495acaca180b2d150e633dddcc07f969471))
+* typed records and relations (knowledge base, sub-project 1) ([773a498](https://github.com/qdequele/memd/commit/773a49862a0dcf0ae53437e7850a99ddc67b1573))
+
+
+### Bug Fixes
+
+* **context:** keep session injection project-specific and agent-aware ([93cd75b](https://github.com/qdequele/memd/commit/93cd75b3c4e0e5e5870420dbbf096533798eb9c0))
+* **daemon:** bound the log, quiet the engine, and self-heal a wedged Meilisearch ([aefe290](https://github.com/qdequele/memd/commit/aefe290e96353ce736401220a1bc3b4bd3920654))
+* **daemon:** bound the log, silence per-request engine noise, self-heal a wedged engine ([9673d8f](https://github.com/qdequele/memd/commit/9673d8fd2e11e154f4d5d6102165ce052ef6c546))
+* **knowledge:** protect agent entities from the crawler; validate before writing ([f815d76](https://github.com/qdequele/memd/commit/f815d760aa138ef22398cd17199880949270403b))
+* **memory:** make recall useful across agents — scopes, crawler noise, watcher storm, access bump ([de7beb1](https://github.com/qdequele/memd/commit/de7beb1fbdf452c7ffd9bd5ab4fd101662151ebf))
+* **memory:** make recall useful across agents — scopes, crawler noise, watcher storm, access bump ([a55c2ac](https://github.com/qdequele/memd/commit/a55c2acbb83053f4bbefa82d7a9a6ca34a030723))
+
 ## [0.3.0](https://github.com/qdequele/memd/compare/v0.2.0...v0.3.0) (2026-06-16)
 
 
