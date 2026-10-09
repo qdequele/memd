@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/qdequele/memd/compare/v0.4.0...v0.4.1) (2026-10-09)
+
+
+### Bug Fixes
+
+* **deps:** restore unicode-normalization dropped by the 0.4.0 release commit ([f352127](https://github.com/qdequele/memd/commit/f352127ec1023137ff46845fc67e7fb660ab0279))
+* **deps:** restore unicode-normalization dropped by the 0.4.0 release commit ([0072c0d](https://github.com/qdequele/memd/commit/0072c0d966b7a731e7a2db8b9ea8cad18429641a))
+
 ## [0.4.0](https://github.com/qdequele/memd/compare/v0.3.0...v0.4.0) (2026-10-09)
 
 
