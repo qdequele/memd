@@ -229,6 +229,37 @@ pub fn backfill_patches(docs: &[Value], projects: &[(String, String)]) -> Vec<Va
         .collect()
 }
 
+/// Checks a relation can be stored before resolving (and possibly stubbing)
+/// either end: a subject, a non-empty predicate, and two different entities.
+fn precheck_relation(r: &RelationInput) -> Result<()> {
+    let id_of = |n: &str| -> Result<String> {
+        let n = n.trim();
+        if is_entity_id(n) {
+            Ok(n.to_string())
+        } else {
+            entity_id(n)
+        }
+    };
+    let subject = r.subject.as_deref().ok_or_else(|| anyhow!("no subject"))?;
+    normalize_predicate(&r.predicate)?;
+    let (s, o) = (id_of(subject)?, id_of(&r.object)?);
+    if s == o {
+        bail!("an entity cannot relate to itself (`{s}`)");
+    }
+    Ok(())
+}
+
+/// The union of `have` and `wanted`, or `None` when nothing is missing.
+pub fn merge_entities(have: &[String], wanted: &[String]) -> Option<Vec<String>> {
+    let mut out = have.to_vec();
+    for w in wanted {
+        if !out.contains(w) {
+            out.push(w.clone());
+        }
+    }
+    (out.len() != have.len()).then_some(out)
+}
+
 fn push_unique(v: &mut Vec<String>, id: String) {
     if !v.contains(&id) {
         v.push(id);
@@ -285,6 +316,10 @@ impl KnowledgeService {
 
     /// Create or update an entity, then add its relations (best-effort).
     pub async fn save_entity(&self, input: EntityInput) -> Result<SaveEntityOutcome> {
+        // Validate before any read or write, so a bad request leaves nothing
+        // behind (no owner stub, no relation stubs).
+        validate_kind(&input.kind_of)?;
+        entity_id(&input.name)?;
         let target = match resolve(&self.mem, &input.name, input.scope.as_deref()).await? {
             Resolution::Found(id) => id,
             Resolution::NotFound => entity_id(&input.name)?,
@@ -340,6 +375,7 @@ impl KnowledgeService {
         let now = now_secs();
         for r in rels {
             let built: Result<Relation> = async {
+                precheck_relation(r)?;
                 let subject = r.subject.as_deref().ok_or_else(|| anyhow!("no subject"))?;
                 let s = self
                     .resolve_or_stub(subject, scope, source, client.clone())
@@ -549,8 +585,17 @@ impl KnowledgeService {
         if let Ok(Some(project)) = self.project_for_scope(&scope).await {
             push_unique(&mut ids, project);
         }
-        req.entities = ids;
+        req.entities = ids.clone();
         let id = self.mem.save(req).await?;
+        // Identical content is deduplicated onto an existing memory, which
+        // keeps its own links: add the ones this save asked for.
+        if let Some(existing) = self.mem.get_item(&id).await?
+            && let Some(merged) = merge_entities(&existing.knowledge.entities, &ids)
+        {
+            self.mem
+                .patch(&[json!({ "id": id, "entities": merged })])
+                .await?;
+        }
         warnings.extend(self.relate(relations, &scope, source, client).await);
         Ok((id, warnings))
     }
@@ -850,6 +895,48 @@ mod tests {
         assert_eq!(
             patches[1],
             serde_json::json!({ "id": "c", "entities": ["entity_x", "entity_memd"] })
+        );
+    }
+
+    fn offline() -> KnowledgeService {
+        // Unreachable engine: any network call fails, so these tests prove the
+        // checks run before anything is written.
+        KnowledgeService::new(MemoryService::new(
+            crate::meili::MeiliClient::new("http://127.0.0.1:1", "k"),
+            0.5,
+        ))
+    }
+
+    #[tokio::test]
+    async fn save_entity_validates_before_any_write() {
+        // Review Important 4: an invalid kind must not leave an owner stub behind.
+        let mut input = EntityInput::new("X", "planet", Source::Mcp);
+        input.owner = Some("Quentin".into());
+        let err = offline().save_entity(input).await.unwrap_err().to_string();
+        assert!(err.contains("unknown kind_of"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn relate_rejects_self_relations_before_stubbing() {
+        let rel = RelationInput {
+            subject: Some("Lumen".into()),
+            predicate: "uses".into(),
+            object: "lumen".into(),
+            note: None,
+        };
+        let w = offline().relate(&[rel], "global", Source::Mcp, None).await;
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("itself"), "{w:?}");
+    }
+
+    #[test]
+    fn merge_entities_reports_only_missing_links() {
+        // Review Important 3: a deduplicated save still gets its links.
+        let have = vec!["entity_a".to_string()];
+        assert_eq!(merge_entities(&have, &["entity_a".into()]), None);
+        assert_eq!(
+            merge_entities(&have, &["entity_b".into(), "entity_a".into()]),
+            Some(vec!["entity_a".to_string(), "entity_b".to_string()])
         );
     }
 }

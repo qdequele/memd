@@ -322,12 +322,48 @@ pub fn readme_headline(md: &str) -> String {
     out.chars().take(400).collect()
 }
 
+/// What existing entities mean for project id assignment:
+/// - `taken`: project ids already bound to a directory (kept by that repo).
+///   A crawler-owned project whose directory is gone is left out, so a moved
+///   repository reclaims its id.
+/// - `blocked`: ids a repository may never take — any non-stub entity that is
+///   not a project (an agent's company, person, product…).
+///
+/// Stubs and agent projects without a path are neither: a repository with that
+/// id adopts them.
+pub fn project_claims(existing: &[Value]) -> (HashMap<String, PathBuf>, HashSet<String>) {
+    let mut taken = HashMap::new();
+    let mut blocked = HashSet::new();
+    for d in existing {
+        let s = |k: &str| d.get(k).and_then(|v| v.as_str());
+        let Some(id) = s("id") else {
+            continue;
+        };
+        if s("status") == Some("stub") {
+            continue;
+        }
+        if s("kind_of") != Some("project") {
+            blocked.insert(id.to_string());
+            continue;
+        }
+        if let Some(path) = s("path") {
+            if s("source") == Some("crawler") && !Path::new(path).exists() {
+                continue;
+            }
+            taken.insert(id.to_string(), PathBuf::from(path));
+        }
+    }
+    (taken, blocked)
+}
+
 /// Give every repository a project entity id. Ids already claimed (by path)
 /// are kept; a new repository takes `slug(basename)`, else
-/// `slug(parent-basename)`, else that with `-2`, `-3`, …
+/// `slug(parent-basename)`, else that with `-2`, `-3`, … — skipping ids that
+/// are taken or blocked (see [`project_claims`]).
 pub fn assign_project_ids(
     repos: &[PathBuf],
     taken: &HashMap<String, PathBuf>,
+    blocked: &HashSet<String>,
 ) -> Vec<(PathBuf, String)> {
     let mut taken = taken.clone();
     let mut out = Vec::new();
@@ -345,16 +381,19 @@ pub fn assign_project_ids(
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let free = |c: &String, taken: &HashMap<String, PathBuf>| {
+            !taken.contains_key(c) && !blocked.contains(c)
+        };
         let first = format!("entity_{}", slug(&base));
         let second = format!("entity_{}", slug(&format!("{parent}-{base}")));
-        let id = if !taken.contains_key(&first) {
+        let id = if free(&first, &taken) {
             first
-        } else if !taken.contains_key(&second) {
+        } else if free(&second, &taken) {
             second
         } else {
             (2..)
                 .map(|n| format!("{second}-{n}"))
-                .find(|c| !taken.contains_key(c))
+                .find(|c| free(c, &taken))
                 .unwrap()
         };
         taken.insert(id.clone(), repo.clone());
@@ -409,9 +448,12 @@ pub fn crawler_writable(
     assigned: &[(PathBuf, String)],
     existing: &[Value],
 ) -> Vec<(PathBuf, String)> {
+    // Stubs are placeholders anyone may fill; everything else an agent wrote
+    // is theirs.
     let agent_owned: HashSet<&str> = existing
         .iter()
         .filter(|d| d.get("source").and_then(|s| s.as_str()) != Some("crawler"))
+        .filter(|d| d.get("status").and_then(|s| s.as_str()) != Some("stub"))
         .filter_map(|d| d.get("id")?.as_str())
         .collect();
     assigned
@@ -421,10 +463,33 @@ pub fn crawler_writable(
         .collect()
 }
 
+/// Path patches for agent-owned project entities a repository adopted: an
+/// agent described the project but never said where it lives.
+pub fn adopt_patches(assigned: &[(PathBuf, String)], existing: &[Value]) -> Vec<Value> {
+    assigned
+        .iter()
+        .filter_map(|(repo, id)| {
+            let d = existing
+                .iter()
+                .find(|d| d.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))?;
+            let s = |k: &str| d.get(k).and_then(|v| v.as_str());
+            if s("source") == Some("crawler")
+                || s("status") == Some("stub")
+                || s("kind_of") != Some("project")
+                || s("path").is_some()
+            {
+                return None;
+            }
+            Some(json!({ "id": id, "path": repo.to_string_lossy() }))
+        })
+        .collect()
+}
+
 /// Status patches for agent-owned project entities whose directory is gone.
 pub fn archive_patches(existing: &[Value]) -> Vec<Value> {
     existing
         .iter()
+        .filter(|d| d.get("kind_of").and_then(|s| s.as_str()) == Some("project"))
         .filter(|d| d.get("source").and_then(|s| s.as_str()) != Some("crawler"))
         .filter(|d| d.get("status").and_then(|s| s.as_str()) != Some("archived"))
         .filter_map(|d| {
@@ -534,26 +599,20 @@ async fn scan_with(crawler: &Crawler, svc: &MemoryService, reset: bool) -> Resul
         }
     }
 
-    // 2. Give every repository a project entity id.
+    // 2. Give every repository a project entity id. Every entity is
+    //    consulted, so a repository never takes an id an agent uses for
+    //    something else. A failed fetch aborts the scan: guessing here would
+    //    overwrite agent-owned entities.
     let existing_projects = svc
         .client()
         .fetch_docs(
-            "type = 'entity' AND kind_of = 'project'",
-            &["id", "path", "source", "status"],
+            "type = 'entity'",
+            &["id", "path", "source", "status", "kind_of"],
         )
-        .await
-        .unwrap_or_default();
-    let taken: HashMap<String, PathBuf> = existing_projects
-        .iter()
-        .filter_map(|d| {
-            Some((
-                d.get("id")?.as_str()?.to_string(),
-                PathBuf::from(d.get("path")?.as_str()?),
-            ))
-        })
-        .collect();
+        .await?;
+    let (taken, blocked) = project_claims(&existing_projects);
     git_roots.sort();
-    let assigned = assign_project_ids(&git_roots, &taken);
+    let assigned = assign_project_ids(&git_roots, &taken, &blocked);
     let by_scope: HashMap<String, String> = assigned
         .iter()
         .map(|(p, id)| (p.to_string_lossy().to_string(), id.clone()))
@@ -607,7 +666,8 @@ async fn scan_with(crawler: &Crawler, svc: &MemoryService, reset: bool) -> Resul
     }
     flush(svc, &mut batch, &mut summary).await;
 
-    // 5. Link-only updates and archived projects.
+    // 5. Link-only updates, adopted and archived projects.
+    patches.extend(adopt_patches(&assigned, &existing_projects));
     patches.extend(archive_patches(&existing_projects));
     if let Err(e) = svc.patch(&patches).await {
         tracing::warn!("patching {} crawled docs failed: {e}", patches.len());
@@ -984,8 +1044,9 @@ mod tests {
             PathBuf::from("/p/memd"),
             PathBuf::from("/q/demos/console"),
         ];
-        let got: HashMap<PathBuf, String> =
-            assign_project_ids(&repos, &taken).into_iter().collect();
+        let got: HashMap<PathBuf, String> = assign_project_ids(&repos, &taken, &HashSet::new())
+            .into_iter()
+            .collect();
         assert_eq!(
             got[&PathBuf::from("/p/cloud/console")],
             "entity_console",
@@ -1044,14 +1105,71 @@ mod tests {
     #[test]
     fn only_agent_owned_projects_with_missing_paths_are_archived() {
         let existing = vec![
-            serde_json::json!({ "id": "entity_gone", "path": "/definitely/missing/xyz", "source": "mcp" }),
-            serde_json::json!({ "id": "entity_done", "path": "/definitely/missing/xyz", "source": "mcp", "status": "archived" }),
-            serde_json::json!({ "id": "entity_crawled", "path": "/definitely/missing/xyz", "source": "crawler" }),
-            serde_json::json!({ "id": "entity_here", "path": "/", "source": "cli" }),
+            serde_json::json!({ "kind_of": "project", "id": "entity_gone", "path": "/definitely/missing/xyz", "source": "mcp" }),
+            serde_json::json!({ "kind_of": "project", "id": "entity_done", "path": "/definitely/missing/xyz", "source": "mcp", "status": "archived" }),
+            serde_json::json!({ "kind_of": "project", "id": "entity_crawled", "path": "/definitely/missing/xyz", "source": "crawler" }),
+            serde_json::json!({ "kind_of": "project", "id": "entity_here", "path": "/", "source": "cli" }),
         ];
         assert_eq!(
             archive_patches(&existing),
             vec![serde_json::json!({ "id": "entity_gone", "status": "archived" })]
         );
+    }
+
+    #[test]
+    fn agent_entities_block_their_id_for_repositories() {
+        // Review Critical 1: an agent's company must never become a crawled project.
+        let existing = vec![
+            serde_json::json!({ "id": "entity_console", "kind_of": "company", "source": "mcp" }),
+        ];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[PathBuf::from("/p/demos/console")], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_demos-console");
+        assert!(
+            crawler_writable(&got, &existing)
+                .iter()
+                .all(|(_, id)| id != "entity_console")
+        );
+    }
+
+    #[test]
+    fn stubs_are_adopted_and_filled_by_the_crawler() {
+        let existing = vec![
+            serde_json::json!({ "id": "entity_memd", "kind_of": "concept", "source": "mcp", "status": "stub" }),
+        ];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[PathBuf::from("/p/memd")], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_memd");
+        assert_eq!(crawler_writable(&got, &existing).len(), 1);
+    }
+
+    #[test]
+    fn agent_projects_without_a_path_are_adopted_not_overwritten() {
+        // Review Important 2: the crawler gives an agent's project its path.
+        let existing =
+            vec![serde_json::json!({ "id": "entity_memd", "kind_of": "project", "source": "mcp" })];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[PathBuf::from("/p/memd")], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_memd");
+        assert!(crawler_writable(&got, &existing).is_empty());
+        assert_eq!(
+            adopt_patches(&got, &existing),
+            vec![serde_json::json!({ "id": "entity_memd", "path": "/p/memd" })]
+        );
+    }
+
+    #[test]
+    fn a_moved_repository_reclaims_its_id() {
+        // Review Important 5: a crawled project whose old path is gone frees its id.
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("b/foo");
+        std::fs::create_dir_all(&new).unwrap();
+        let old = dir.path().join("a/foo").to_string_lossy().to_string();
+        let existing = vec![
+            serde_json::json!({ "id": "entity_foo", "kind_of": "project", "source": "crawler", "path": old }),
+        ];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[new], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_foo");
     }
 }

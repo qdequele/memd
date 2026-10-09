@@ -799,29 +799,11 @@ pub async fn context(
         facets: Vec::new(),
     };
 
-    let esc = |s: &str| s.replace('\'', "\\'");
-    // Pass 1: real memories (saved by agents or the user), newest first.
-    // Pass 2: other agents' memory *files* about this project — but never
-    // files inside the project itself (the agent reads those from disk) and
-    // never the calling agent's own memory directory (already in its context).
-    let mut files_filter = vec![
-        "source = 'crawler'".to_string(),
-        "type = 'fact'".to_string(),
-    ];
-    if scope != "global" {
-        files_filter.push(format!("NOT source_path STARTS WITH '{}/'", esc(&scope)));
-    }
-    for root in agent
+    let own_roots = agent
         .as_deref()
         .map(crate::agents::knowledge_roots_of)
-        .unwrap_or_default()
-    {
-        files_filter.push(format!(
-            "NOT source_path STARTS WITH '{}/'",
-            esc(&root.to_string_lossy())
-        ));
-    }
-    let passes = [vec!["source != 'crawler'".to_string()], files_filter];
+        .unwrap_or_default();
+    let passes = context_passes(&scope, &own_roots);
 
     let mut hits = Vec::new();
     for extra in passes {
@@ -1046,6 +1028,37 @@ fn render_explore(v: &Value) -> String {
         }
     }
     out
+}
+
+/// The filter passes `memd context` runs, in order:
+/// 1. real memories saved by agents or the user — never entities: they default
+///    to `global` and would land in every session (the project header and
+///    `explore` cover them);
+/// 2. other agents' memory *files* about the project — never files inside the
+///    project itself (the agent reads those from disk) and never the calling
+///    agent's own memory directory (already in its context).
+fn context_passes(scope: &str, own_roots: &[PathBuf]) -> Vec<Vec<String>> {
+    let esc = |s: &str| s.replace('\'', "\\'");
+    let mut files = vec![
+        "source = 'crawler'".to_string(),
+        "type = 'fact'".to_string(),
+    ];
+    if scope != "global" {
+        files.push(format!("NOT source_path STARTS WITH '{}/'", esc(scope)));
+    }
+    for root in own_roots {
+        files.push(format!(
+            "NOT source_path STARTS WITH '{}/'",
+            esc(&root.to_string_lossy())
+        ));
+    }
+    vec![
+        vec![
+            "source != 'crawler'".to_string(),
+            "type != 'entity'".to_string(),
+        ],
+        files,
+    ]
 }
 
 /// The current project's header block, if the scope belongs to one.
@@ -1835,5 +1848,24 @@ mod tests {
     fn up_starts_when_daemon_is_down() {
         assert_eq!(up_action(false, false), UpAction::Start);
         assert_eq!(up_action(false, true), UpAction::Start);
+    }
+
+    #[test]
+    fn context_never_injects_entities_as_memories() {
+        // Review Important 7: entities default to `global`; listing them would
+        // put every entity into every session.
+        let passes = context_passes("/p/memd", &[]);
+        assert!(
+            passes[0].contains(&"type != 'entity'".to_string()),
+            "{passes:?}"
+        );
+        assert!(passes[1].contains(&"type = 'fact'".to_string()));
+        assert!(
+            passes[1]
+                .iter()
+                .any(|f| f.contains("STARTS WITH '/p/memd/'"))
+        );
+        let own = context_passes("/p/memd", &[PathBuf::from("/h/.claude/projects")]);
+        assert!(own[1].iter().any(|f| f.contains("/h/.claude/projects/")));
     }
 }

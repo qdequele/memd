@@ -137,7 +137,7 @@ fn tool_defs() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "entities": { "type": "array", "items": { "type": "string" }, "description": "Names (or ids) of the entities this memory is about. Unknown names become stub entities. The project the scope belongs to is linked automatically." },
+                    "entities": { "type": "array", "items": { "type": "string" }, "description": "Names (or ids) of the entities this memory is about. Unknown names become stub entities. Added to the memory's existing links." },
                     "relations": { "type": "array", "description": format!("Relations you learned, as {{subject, predicate, object, note?}}. Predicates: {predicates} (free text allowed)."), "items": { "type": "object", "properties": { "subject": { "type": "string" }, "predicate": { "type": "string" }, "object": { "type": "string" }, "note": { "type": "string" } }, "required": ["subject", "predicate", "object"] } },
                     "id": { "type": "string" },
                     "content": { "type": "string" },
@@ -684,5 +684,21 @@ mod tests {
         assert_eq!(e.source, Source::Mcp);
         assert!(parse_entity_input(&json!({ "kind_of": "product" })).is_err());
         assert!(parse_entity_input(&json!({ "name": "X" })).is_err());
+    }
+
+    #[test]
+    fn update_memory_does_not_promise_an_automatic_project_link() {
+        // Review Important 6.
+        let defs = tool_defs();
+        let update = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "update_memory")
+            .unwrap();
+        let text = update["inputSchema"]["properties"]["entities"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(!text.contains("linked automatically"), "{text}");
     }
 }
