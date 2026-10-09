@@ -4,7 +4,7 @@
 //! timestamps, run hybrid search. Embedding is delegated to Meilisearch.
 
 use super::classify;
-use super::model::{MemoryItem, MemoryType, Source, now_secs};
+use super::model::{Knowledge, MemoryItem, MemoryType, Source, now_secs};
 use crate::config::Config;
 use crate::history::{EventAction, EventLog, EventQuery, MemoryEvent};
 use crate::meili::MeiliClient;
@@ -24,6 +24,8 @@ pub struct SaveRequest {
     pub source: Option<Source>,
     pub source_path: Option<String>,
     pub source_client: Option<String>,
+    /// Entity ids this memory mentions (already resolved by the caller).
+    pub entities: Vec<String>,
 }
 
 /// A request to recall memories.
@@ -40,6 +42,12 @@ pub struct GetRequest {
     /// Additional raw Meilisearch filter clauses, ANDed with the rest. Used by
     /// `memd context` to shape what gets injected into a session.
     pub extra_filters: Vec<String>,
+    /// Only memories that mention this entity id.
+    pub entity: Option<String>,
+    /// Only records with this `status`.
+    pub status: Option<String>,
+    /// Only entities of this kind.
+    pub kind_of: Option<String>,
 }
 
 /// Controls how much of each memory a query returns. The funnel is:
@@ -201,6 +209,10 @@ impl MemoryService {
             updated_at: now,
             last_accessed_at: None,
             content_hash: hash,
+            knowledge: Knowledge {
+                entities: req.entities,
+                ..Default::default()
+            },
         };
         self.client.upsert(&item).await?;
         self.record_mutation(
@@ -259,6 +271,7 @@ impl MemoryService {
             updated_at: now,
             last_accessed_at: None,
             content_hash: hash,
+            knowledge: Knowledge::default(),
         })
     }
 
@@ -507,7 +520,7 @@ impl MemoryService {
             .unwrap_or(false);
 
         let fields: Vec<String> = if group_by.is_empty() {
-            ["type", "scope", "source"]
+            ["type", "scope", "source", "kind_of", "status"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
@@ -694,6 +707,22 @@ fn build_filters(req: &GetRequest, with_subscopes: bool) -> Vec<String> {
     if let Some(until) = req.until {
         f.push(format!("created_at <= {until}"));
     }
+    if let Some(e) = &req.entity {
+        f.push(format!("entities = '{}'", escape(e)));
+    }
+    if let Some(s) = &req.status {
+        if s == "accepted" {
+            // Decisions saved before statuses existed count as accepted.
+            f.push(
+                "(status = 'accepted' OR (type = 'decision' AND status NOT EXISTS))".to_string(),
+            );
+        } else {
+            f.push(format!("status = '{}'", escape(s)));
+        }
+    }
+    if let Some(k) = &req.kind_of {
+        f.push(format!("kind_of = '{}'", escape(k)));
+    }
     f.extend(req.extra_filters.iter().cloned());
     f
 }
@@ -869,5 +898,32 @@ mod tests {
         assert_eq!(item.created_at, 42);
         assert_eq!(item.scope, "/r");
         assert_eq!(item.title.as_deref(), Some("README.md"));
+    }
+
+    #[test]
+    fn builds_knowledge_filters() {
+        let req = GetRequest {
+            entity: Some("entity_lumen".into()),
+            status: Some("superseded".into()),
+            kind_of: Some("project".into()),
+            ..Default::default()
+        };
+        let f = build_filters(&req, true);
+        assert!(
+            f.contains(&"entities = 'entity_lumen'".to_string()),
+            "{f:?}"
+        );
+        assert!(f.contains(&"status = 'superseded'".to_string()), "{f:?}");
+        assert!(f.contains(&"kind_of = 'project'".to_string()), "{f:?}");
+
+        // Decisions saved before statuses existed count as accepted (spec §10).
+        let accepted = GetRequest {
+            status: Some("accepted".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_filters(&accepted, true),
+            vec!["(status = 'accepted' OR (type = 'decision' AND status NOT EXISTS))".to_string()]
+        );
     }
 }

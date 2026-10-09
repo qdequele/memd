@@ -276,6 +276,7 @@ pub async fn add(
             source: Some(Source::Cli),
             source_path: Some(abs_str),
             source_client: None,
+            entities: Vec::new(),
         }
     } else {
         let content =
@@ -289,6 +290,7 @@ pub async fn add(
             source: Some(Source::Cli),
             source_path: None,
             source_client: None,
+            entities: Vec::new(),
         }
     };
 
@@ -327,6 +329,9 @@ pub async fn search(
         until: None,
         semantic_ratio,
         extra_filters: Vec::new(),
+        entity: None,
+        status: None,
+        kind_of: None,
     };
     // CLI shows a plain snippet; disable HTML highlight tags.
     let opts = ProjectionOptions {
@@ -945,6 +950,7 @@ pub async fn capture(agent: Option<String>) -> Result<()> {
         source: Some(Source::Cli),
         source_path: None,
         source_client: Some(client),
+        entities: Vec::new(),
     };
     let id = svc.save(req).await?;
     eprintln!("memd: captured turn -> {id}");

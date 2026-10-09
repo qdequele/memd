@@ -224,6 +224,7 @@ async fn save_memory(svc: &MemoryService, args: Value) -> anyhow::Result<Value> 
         source: Some(Source::Mcp),
         source_path: None,
         source_client: str_field(&args, "source_client"),
+        entities: Vec::new(),
     };
     let saved_id = svc.save(req).await?;
     Ok(json!({ "id": saved_id }))
@@ -257,6 +258,9 @@ async fn get_memory(svc: &MemoryService, args: Value) -> anyhow::Result<Value> {
             .and_then(|r| r.as_f64())
             .map(|f| f as f32),
         extra_filters: Vec::new(),
+        entity: None,
+        status: None,
+        kind_of: None,
     };
     let opts = projection_opts(&args, ProjectionOptions::search_default());
     let result = svc.get(req, &opts).await?;
