@@ -109,6 +109,14 @@ const META_FIELDS: &[&str] = &[
     "last_accessed_at",
 ];
 
+/// What the crawler knows about a document it wrote.
+#[derive(Debug, Clone)]
+pub struct CrawledDoc {
+    pub hash: String,
+    pub created_at: i64,
+    pub entities: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct MemoryService {
     client: MeiliClient,
@@ -232,6 +240,7 @@ impl MemoryService {
     /// (same content hash) and therefore needs no re-embedding. `existing` is
     /// the stored `(content_hash, created_at)` for this path, if any; the
     /// original `created_at` is preserved on re-index.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_crawled(
         &self,
         source_path: &str,
@@ -240,6 +249,7 @@ impl MemoryService {
         scope: String,
         title: Option<String>,
         existing: Option<(&str, i64)>,
+        entities: Vec<String>,
     ) -> Option<MemoryItem> {
         let id = path_id(source_path);
         let hash = content_hash(&content);
@@ -271,24 +281,43 @@ impl MemoryService {
             updated_at: now,
             last_accessed_at: None,
             content_hash: hash,
-            knowledge: Knowledge::default(),
+            knowledge: Knowledge {
+                entities,
+                ..Default::default()
+            },
         })
     }
 
     /// Load the crawler's stored state: `path_id → (content_hash, created_at)`
     /// for every crawler document, in a few paged requests.
-    pub async fn crawled_state(&self) -> Result<HashMap<String, (String, i64)>> {
+    pub async fn crawled_state(&self) -> Result<HashMap<String, CrawledDoc>> {
         let docs = self
             .client
-            .fetch_docs("source = 'crawler'", &["id", "content_hash", "created_at"])
+            .fetch_docs(
+                "source = 'crawler'",
+                &["id", "content_hash", "created_at", "entities"],
+            )
             .await?;
         Ok(docs
             .into_iter()
             .filter_map(|d| {
                 let id = d.get("id")?.as_str()?.to_string();
-                let hash = d.get("content_hash")?.as_str()?.to_string();
-                let created = d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0);
-                Some((id, (hash, created)))
+                Some((
+                    id,
+                    CrawledDoc {
+                        hash: d.get("content_hash")?.as_str()?.to_string(),
+                        created_at: d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0),
+                        entities: d
+                            .get("entities")
+                            .and_then(|e| e.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    },
+                ))
             })
             .collect())
     }
@@ -307,6 +336,7 @@ impl MemoryService {
         ty: MemoryType,
         scope: String,
         title: Option<String>,
+        entities: Vec<String>,
     ) -> Result<bool> {
         let existing = self.client.get_doc(&path_id(source_path)).await?;
         let existing = existing.as_ref().and_then(|d| {
@@ -315,7 +345,7 @@ impl MemoryService {
                 d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0),
             ))
         });
-        match self.prepare_crawled(source_path, content, ty, scope, title, existing) {
+        match self.prepare_crawled(source_path, content, ty, scope, title, existing, entities) {
             Some(item) => {
                 self.client.upsert(&item).await?;
                 Ok(true)
@@ -896,7 +926,8 @@ mod tests {
                 MemoryType::ProjectOverview,
                 "/r".into(),
                 None,
-                Some((&hash, 42))
+                Some((&hash, 42)),
+                vec!["entity_r".into()]
             )
             .is_none()
         );
@@ -908,11 +939,13 @@ mod tests {
                 "/r/".into(),
                 None,
                 Some((&hash, 42)),
+                vec!["entity_r".into()],
             )
             .unwrap();
         assert_eq!(item.created_at, 42);
         assert_eq!(item.scope, "/r");
         assert_eq!(item.title.as_deref(), Some("README.md"));
+        assert_eq!(item.knowledge.entities, vec!["entity_r"]);
     }
 
     #[test]
