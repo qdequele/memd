@@ -125,6 +125,9 @@ client can connect to the same daemon two ways:
 | `update_memory(id, …)` · `forget_memory(id)` | Edit / delete |
 | `list_memories(type?, scope?, …)` | Browse (metadata-only by default) |
 | `stats(group_by?)` | Counts + server-side facet distributions |
+| `save_entity(name, kind_of, …, relations?)` | Create/update a company, team, person, project, product, service, customer or concept |
+| `explore(name, depth?)` | An entity, its relations both ways, and the memories that mention it |
+| `forget_relation(subject, predicate, object)` | Remove one relation |
 
 **The recall funnel keeps results token-safe:** `get_memory`/`list_memories` return
 metadata + a cropped, highlighted snippet → `read_memory(id)` returns the full blob
@@ -167,6 +170,9 @@ memd search "<query>" [--type --since --semantic-ratio --limit]
 memd forget <id>
 
 memd crawl run [--reset]|status|config        Passive ingestion (--reset rebuilds from scratch)
+memd entity <name> [--depth 2]               Explore an entity
+memd entity add <name> --kind <kind> [...]   Create/update an entity
+memd relate <subject> <predicate> <object>   Declare a relation
 memd context [--scope --query --limit]        Print memories as markdown (for hooks)
 memd capture                                  Auto-capture a turn (Stop-hook stdin)
 memd directives install|uninstall            Inject usage directives into agent files

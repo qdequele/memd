@@ -4,7 +4,7 @@
 //! timestamps, run hybrid search. Embedding is delegated to Meilisearch.
 
 use super::classify;
-use super::model::{MemoryItem, MemoryType, Source, now_secs};
+use super::model::{Knowledge, MemoryItem, MemoryType, Source, now_secs};
 use crate::config::Config;
 use crate::history::{EventAction, EventLog, EventQuery, MemoryEvent};
 use crate::meili::MeiliClient;
@@ -24,6 +24,8 @@ pub struct SaveRequest {
     pub source: Option<Source>,
     pub source_path: Option<String>,
     pub source_client: Option<String>,
+    /// Entity ids this memory mentions (already resolved by the caller).
+    pub entities: Vec<String>,
 }
 
 /// A request to recall memories.
@@ -40,6 +42,12 @@ pub struct GetRequest {
     /// Additional raw Meilisearch filter clauses, ANDed with the rest. Used by
     /// `memd context` to shape what gets injected into a session.
     pub extra_filters: Vec<String>,
+    /// Only memories that mention this entity id.
+    pub entity: Option<String>,
+    /// Only records with this `status`.
+    pub status: Option<String>,
+    /// Only entities of this kind.
+    pub kind_of: Option<String>,
 }
 
 /// Controls how much of each memory a query returns. The funnel is:
@@ -100,6 +108,14 @@ const META_FIELDS: &[&str] = &[
     "updated_at",
     "last_accessed_at",
 ];
+
+/// What the crawler knows about a document it wrote.
+#[derive(Debug, Clone)]
+pub struct CrawledDoc {
+    pub hash: String,
+    pub created_at: i64,
+    pub entities: Vec<String>,
+}
 
 #[derive(Clone)]
 pub struct MemoryService {
@@ -201,6 +217,10 @@ impl MemoryService {
             updated_at: now,
             last_accessed_at: None,
             content_hash: hash,
+            knowledge: Knowledge {
+                entities: req.entities,
+                ..Default::default()
+            },
         };
         self.client.upsert(&item).await?;
         self.record_mutation(
@@ -220,6 +240,7 @@ impl MemoryService {
     /// (same content hash) and therefore needs no re-embedding. `existing` is
     /// the stored `(content_hash, created_at)` for this path, if any; the
     /// original `created_at` is preserved on re-index.
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_crawled(
         &self,
         source_path: &str,
@@ -228,6 +249,7 @@ impl MemoryService {
         scope: String,
         title: Option<String>,
         existing: Option<(&str, i64)>,
+        entities: Vec<String>,
     ) -> Option<MemoryItem> {
         let id = path_id(source_path);
         let hash = content_hash(&content);
@@ -259,23 +281,43 @@ impl MemoryService {
             updated_at: now,
             last_accessed_at: None,
             content_hash: hash,
+            knowledge: Knowledge {
+                entities,
+                ..Default::default()
+            },
         })
     }
 
     /// Load the crawler's stored state: `path_id → (content_hash, created_at)`
     /// for every crawler document, in a few paged requests.
-    pub async fn crawled_state(&self) -> Result<HashMap<String, (String, i64)>> {
+    pub async fn crawled_state(&self) -> Result<HashMap<String, CrawledDoc>> {
         let docs = self
             .client
-            .fetch_docs("source = 'crawler'", &["id", "content_hash", "created_at"])
+            .fetch_docs(
+                "source = 'crawler'",
+                &["id", "content_hash", "created_at", "entities"],
+            )
             .await?;
         Ok(docs
             .into_iter()
             .filter_map(|d| {
                 let id = d.get("id")?.as_str()?.to_string();
-                let hash = d.get("content_hash")?.as_str()?.to_string();
-                let created = d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0);
-                Some((id, (hash, created)))
+                Some((
+                    id,
+                    CrawledDoc {
+                        hash: d.get("content_hash")?.as_str()?.to_string(),
+                        created_at: d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0),
+                        entities: d
+                            .get("entities")
+                            .and_then(|e| e.as_array())
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|x| x.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    },
+                ))
             })
             .collect())
     }
@@ -294,6 +336,7 @@ impl MemoryService {
         ty: MemoryType,
         scope: String,
         title: Option<String>,
+        entities: Vec<String>,
     ) -> Result<bool> {
         let existing = self.client.get_doc(&path_id(source_path)).await?;
         let existing = existing.as_ref().and_then(|d| {
@@ -302,13 +345,52 @@ impl MemoryService {
                 d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0),
             ))
         });
-        match self.prepare_crawled(source_path, content, ty, scope, title, existing) {
+        match self.prepare_crawled(source_path, content, ty, scope, title, existing, entities) {
             Some(item) => {
                 self.client.upsert(&item).await?;
                 Ok(true)
             }
             None => Ok(false),
         }
+    }
+
+    /// Fetch a memory without bumping `last_accessed_at`.
+    pub async fn get_item(&self, id: &str) -> Result<Option<MemoryItem>> {
+        Ok(self
+            .client
+            .get_doc(id)
+            .await?
+            .and_then(|d| serde_json::from_value(d).ok()))
+    }
+
+    /// Write an entity document as-is and record the mutation. Unlike
+    /// [`save`](Self::save) this never dedups on content: two entities can
+    /// legitimately share (empty) content.
+    pub async fn put_entity(&self, item: &MemoryItem, created: bool) -> Result<()> {
+        self.client.upsert(item).await?;
+        self.record_mutation(
+            if created {
+                EventAction::Create
+            } else {
+                EventAction::Update
+            },
+            &item.id,
+            item.title.clone(),
+            Some(item.r#type.clone()),
+            Some(item.scope.clone()),
+            Source::parse(&item.source).unwrap_or(Source::Cli),
+            item.source_client.clone(),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Merge partial documents into existing ones (`PUT`).
+    pub async fn patch(&self, patches: &[Value]) -> Result<()> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        self.client.update_many(patches).await
     }
 
     /// Upsert a batch of documents in one Meilisearch task (one embedding pass
@@ -451,32 +533,8 @@ impl MemoryService {
         Ok(true)
     }
 
-    /// List memories matching optional filters (most recent first). Returns
+    /// List memories matching a request (most recent first). Returns
     /// metadata-only rows by default — token-safe regardless of `limit`.
-    pub async fn list(
-        &self,
-        ty: Option<MemoryType>,
-        scope: Option<String>,
-        limit: usize,
-        offset: usize,
-        opts: &ProjectionOptions,
-    ) -> Result<QueryResult> {
-        let mut body = json!({
-            "q": "",
-            "limit": limit,
-            "offset": offset,
-            "sort": ["updated_at:desc"],
-        });
-        apply_projection(&mut body, opts);
-        let req = GetRequest {
-            r#type: ty,
-            scope,
-            ..Default::default()
-        };
-        self.run_filtered(body, &req, opts).await
-    }
-
-    /// Like [`list`](Self::list) but with the full request (extra filters).
     pub async fn list_with(
         &self,
         req: &GetRequest,
@@ -507,7 +565,7 @@ impl MemoryService {
             .unwrap_or(false);
 
         let fields: Vec<String> = if group_by.is_empty() {
-            ["type", "scope", "source"]
+            ["type", "scope", "source", "kind_of", "status"]
                 .iter()
                 .map(|s| s.to_string())
                 .collect()
@@ -694,6 +752,22 @@ fn build_filters(req: &GetRequest, with_subscopes: bool) -> Vec<String> {
     if let Some(until) = req.until {
         f.push(format!("created_at <= {until}"));
     }
+    if let Some(e) = &req.entity {
+        f.push(format!("entities = '{}'", escape(e)));
+    }
+    if let Some(s) = &req.status {
+        if s == "accepted" {
+            // Decisions saved before statuses existed count as accepted.
+            f.push(
+                "(status = 'accepted' OR (type = 'decision' AND status NOT EXISTS))".to_string(),
+            );
+        } else {
+            f.push(format!("status = '{}'", escape(s)));
+        }
+    }
+    if let Some(k) = &req.kind_of {
+        f.push(format!("kind_of = '{}'", escape(k)));
+    }
     f.extend(req.extra_filters.iter().cloned());
     f
 }
@@ -852,7 +926,8 @@ mod tests {
                 MemoryType::ProjectOverview,
                 "/r".into(),
                 None,
-                Some((&hash, 42))
+                Some((&hash, 42)),
+                vec!["entity_r".into()]
             )
             .is_none()
         );
@@ -864,10 +939,39 @@ mod tests {
                 "/r/".into(),
                 None,
                 Some((&hash, 42)),
+                vec!["entity_r".into()],
             )
             .unwrap();
         assert_eq!(item.created_at, 42);
         assert_eq!(item.scope, "/r");
         assert_eq!(item.title.as_deref(), Some("README.md"));
+        assert_eq!(item.knowledge.entities, vec!["entity_r"]);
+    }
+
+    #[test]
+    fn builds_knowledge_filters() {
+        let req = GetRequest {
+            entity: Some("entity_lumen".into()),
+            status: Some("superseded".into()),
+            kind_of: Some("project".into()),
+            ..Default::default()
+        };
+        let f = build_filters(&req, true);
+        assert!(
+            f.contains(&"entities = 'entity_lumen'".to_string()),
+            "{f:?}"
+        );
+        assert!(f.contains(&"status = 'superseded'".to_string()), "{f:?}");
+        assert!(f.contains(&"kind_of = 'project'".to_string()), "{f:?}");
+
+        // Decisions saved before statuses existed count as accepted (spec §10).
+        let accepted = GetRequest {
+            status: Some("accepted".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_filters(&accepted, true),
+            vec!["(status = 'accepted' OR (type = 'decision' AND status NOT EXISTS))".to_string()]
+        );
     }
 }

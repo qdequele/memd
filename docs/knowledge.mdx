@@ -1,0 +1,74 @@
+---
+title: Knowledge
+description: "Entities, relations and a shared vocabulary across every agent."
+---
+
+memd stores more than notes. It keeps the **things** in your world —
+companies, teams, people, projects, products, services, customers, concepts —
+and the **relations** between them, so any agent can ask "what is Lumen and
+what depends on it?" and get one structured answer.
+
+memd never runs a model. Agents name things as they save, and the crawler adds
+one project entity per git repository it finds.
+
+## Entities
+
+An entity is a memory with `type = entity`:
+
+| Field | Meaning |
+|-------|---------|
+| `name` | Canonical display name. |
+| `kind_of` | `company`, `team`, `person`, `project`, `product`, `service`, `customer`, `concept`. |
+| `aliases` | Other names. Saving under an alias updates the same entity. |
+| `owner` | Owning person, team or company. |
+| `status` | `active`, `archived`, … (`stub` for names nobody described yet). |
+| `summary` | The description. |
+
+Ids are `entity_<slug>` — `Meilisearch Lab`, `meilisearch-lab` and
+`MEILISEARCH LAB` are the same entity.
+
+## Relations
+
+One edge per fact: `Lumen —part_of→ Meilisearch Lab`. Suggested predicates:
+`part_of`, `depends_on`, `owns`, `uses`, `replaces`, `works_on`, `member_of`,
+`customer_of`, `related_to`. Any verb phrase works and is normalised
+(`Depends On` → `depends_on`).
+
+Naming an entity that does not exist yet creates a **stub**, so a relation
+always lands somewhere. Describing it later with `save_entity` fills the stub.
+
+## Automatic links
+
+- Every git repository becomes a `project` entity, described by its README's
+  heading and first paragraph. An agent can enrich it; the crawler then leaves
+  it alone.
+- Every crawled file in a repository, and every memory saved with that
+  repository's scope, is linked to the project entity.
+- A new session in a described project starts with one line about it:
+
+  ```
+  **memd** — project · owner: Quentin · status: active
+    part_of → Meilisearch side projects · uses → Meilisearch (local engine, pinned)
+  ```
+
+## MCP tools
+
+| Tool | Purpose |
+|------|---------|
+| `save_entity(name, kind_of, description?, aliases?, owner?, status?, scope?, tags?, url?, relations?)` | Create or update an entity. |
+| `explore(name, depth?, limit?, scope?)` | The entity, its relations both ways, related entities, and memories that mention it. |
+| `forget_relation(subject, predicate, object)` | Remove one relation. |
+| `save_memory(…, entities?, relations?)` | Link a memory to entities and declare relations. |
+| `get_memory` / `list_memories` `(…, entity?, status?, kind_of?)` | Filter by entity, status, kind. |
+
+## CLI
+
+```sh
+memd entity "Lumen"                    # explore
+memd entity "Lumen" --depth 2
+memd entity add "Lumen" --kind product --desc "LLM gateway" --alias lumen-gw --owner Quentin
+memd relate "Lumen" part_of "Meilisearch Lab" --note "data plane"
+memd unrelate "Lumen" part_of "Meilisearch Lab"
+memd search "billing" --entity "Meilisearch Lab" --status accepted
+memd doctor --fix                      # links existing memories to their project
+```

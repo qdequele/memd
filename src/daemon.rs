@@ -47,6 +47,10 @@ pub async fn serve() -> Result<()> {
         .ensure()
         .await
         .context("ensuring memory_events index")?;
+    crate::knowledge::relations::RelationStore::from_client(svc.client())
+        .ensure()
+        .await
+        .context("ensuring memory_relations index")?;
     tracing::info!("Meilisearch ready; indexes configured");
 
     // Restart channel: the updater and the health watchdog both use it.

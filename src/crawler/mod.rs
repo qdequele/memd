@@ -15,9 +15,11 @@
 //! everywhere: they are copies of a repository that is already indexed.
 
 use crate::config::Config;
+use crate::knowledge::ident::slug;
 use crate::memory::classify;
 use crate::memory::service::path_id;
-use crate::memory::{MemoryItem, MemoryService};
+use crate::memory::service::{CrawledDoc, content_hash};
+use crate::memory::{Knowledge, MemoryItem, MemoryService, MemoryType};
 use crate::paths;
 use anyhow::Result;
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -25,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::time::Duration;
 use walkdir::WalkDir;
 
@@ -51,6 +54,8 @@ pub struct Crawler {
     roots: Vec<PathBuf>,
     /// Agent knowledge roots (memories, global rules) that exist on this machine.
     knowledge_roots: Vec<PathBuf>,
+    /// Repository path → project entity id, refreshed by every scan.
+    projects: RwLock<HashMap<String, String>>,
 }
 
 impl Crawler {
@@ -70,7 +75,16 @@ impl Crawler {
                 .filter(|r| r.exists())
                 .collect(),
             knowledge_roots: crate::agents::knowledge_roots(),
+            projects: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// The project entity ids for a scope (empty or one element).
+    fn project_ids_for(&self, scope: &str) -> Vec<String> {
+        self.projects
+            .read()
+            .map(|m| m.get(scope).cloned().into_iter().collect())
+            .unwrap_or_default()
     }
 
     /// All directories the watcher should observe.
@@ -262,6 +276,239 @@ fn is_linked_worktree(dir: &Path) -> bool {
     dir.join(".git").is_file()
 }
 
+/// "Heading — first paragraph" of a README, at most 400 characters. Badges,
+/// HTML, images, tables, quotes and code fences are skipped.
+pub fn readme_headline(md: &str) -> String {
+    let mut heading: Option<String> = None;
+    let mut para: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    for line in md.lines() {
+        let t = line.trim();
+        if t.starts_with("```") {
+            in_fence = !in_fence;
+            continue;
+        }
+        if in_fence {
+            continue;
+        }
+        if t.is_empty() {
+            if !para.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if let Some(h) = t.strip_prefix('#') {
+            if heading.is_none() && para.is_empty() {
+                heading = Some(h.trim_start_matches('#').trim().to_string());
+                continue;
+            }
+            if !para.is_empty() {
+                break;
+            }
+            continue;
+        }
+        let noise = ["<", "!", "[!", "[![", "|", ">", "---", "==="];
+        if noise.iter().any(|n| t.starts_with(n)) {
+            continue;
+        }
+        para.push(t);
+    }
+    let body = para.join(" ");
+    let out = match (heading, body.is_empty()) {
+        (Some(h), false) => format!("{h} — {body}"),
+        (Some(h), true) => h,
+        (None, _) => body,
+    };
+    out.chars().take(400).collect()
+}
+
+/// What existing entities mean for project id assignment:
+/// - `taken`: project ids already bound to a directory (kept by that repo).
+///   A crawler-owned project whose directory is gone is left out, so a moved
+///   repository reclaims its id.
+/// - `blocked`: ids a repository may never take — any non-stub entity that is
+///   not a project (an agent's company, person, product…).
+///
+/// Stubs and agent projects without a path are neither: a repository with that
+/// id adopts them.
+pub fn project_claims(existing: &[Value]) -> (HashMap<String, PathBuf>, HashSet<String>) {
+    let mut taken = HashMap::new();
+    let mut blocked = HashSet::new();
+    for d in existing {
+        let s = |k: &str| d.get(k).and_then(|v| v.as_str());
+        let Some(id) = s("id") else {
+            continue;
+        };
+        if s("status") == Some("stub") {
+            continue;
+        }
+        if s("kind_of") != Some("project") {
+            blocked.insert(id.to_string());
+            continue;
+        }
+        if let Some(path) = s("path") {
+            if s("source") == Some("crawler") && !Path::new(path).exists() {
+                continue;
+            }
+            taken.insert(id.to_string(), PathBuf::from(path));
+        }
+    }
+    (taken, blocked)
+}
+
+/// Give every repository a project entity id. Ids already claimed (by path)
+/// are kept; a new repository takes `slug(basename)`, else
+/// `slug(parent-basename)`, else that with `-2`, `-3`, … — skipping ids that
+/// are taken or blocked (see [`project_claims`]).
+pub fn assign_project_ids(
+    repos: &[PathBuf],
+    taken: &HashMap<String, PathBuf>,
+    blocked: &HashSet<String>,
+) -> Vec<(PathBuf, String)> {
+    let mut taken = taken.clone();
+    let mut out = Vec::new();
+    for repo in repos {
+        if let Some((id, _)) = taken.iter().find(|(_, p)| *p == repo) {
+            out.push((repo.clone(), id.clone()));
+            continue;
+        }
+        let base = repo
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let parent = repo
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let free = |c: &String, taken: &HashMap<String, PathBuf>| {
+            !taken.contains_key(c) && !blocked.contains(c)
+        };
+        let first = format!("entity_{}", slug(&base));
+        let second = format!("entity_{}", slug(&format!("{parent}-{base}")));
+        let id = if free(&first, &taken) {
+            first
+        } else if free(&second, &taken) {
+            second
+        } else {
+            (2..)
+                .map(|n| format!("{second}-{n}"))
+                .find(|c| free(c, &taken))
+                .unwrap()
+        };
+        taken.insert(id.clone(), repo.clone());
+        out.push((repo.clone(), id));
+    }
+    out
+}
+
+/// The crawler-owned entity document for a repository.
+pub fn project_entity_item(
+    id: &str,
+    repo: &Path,
+    readme: Option<&str>,
+    created_at: Option<i64>,
+    now: i64,
+) -> MemoryItem {
+    let name = repo
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let path = repo.to_string_lossy().to_string();
+    let summary = readme.map(readme_headline).filter(|s| !s.is_empty());
+    let content = summary.clone().unwrap_or_default();
+    MemoryItem {
+        id: id.to_string(),
+        content_hash: content_hash(&format!("{id}\n{path}\n{content}")),
+        content,
+        title: Some(name.clone()),
+        summary,
+        r#type: "entity".to_string(),
+        tags: Vec::new(),
+        scope: path.clone(),
+        source: "crawler".to_string(),
+        source_path: None,
+        source_client: None,
+        created_at: created_at.unwrap_or(now),
+        updated_at: now,
+        last_accessed_at: None,
+        knowledge: Knowledge {
+            name: Some(name),
+            name_key: Some(id.trim_start_matches("entity_").to_string()),
+            kind_of: Some("project".to_string()),
+            path: Some(path),
+            ..Default::default()
+        },
+    }
+}
+
+/// The `(repo, id)` pairs the crawler may (re)write. A project entity whose
+/// stored source is not `crawler` belongs to an agent and is left alone.
+pub fn crawler_writable(
+    assigned: &[(PathBuf, String)],
+    existing: &[Value],
+) -> Vec<(PathBuf, String)> {
+    // Stubs are placeholders anyone may fill; everything else an agent wrote
+    // is theirs.
+    let agent_owned: HashSet<&str> = existing
+        .iter()
+        .filter(|d| d.get("source").and_then(|s| s.as_str()) != Some("crawler"))
+        .filter(|d| d.get("status").and_then(|s| s.as_str()) != Some("stub"))
+        .filter_map(|d| d.get("id")?.as_str())
+        .collect();
+    assigned
+        .iter()
+        .filter(|(_, id)| !agent_owned.contains(id.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Path patches for agent-owned project entities a repository adopted: an
+/// agent described the project but never said where it lives.
+pub fn adopt_patches(assigned: &[(PathBuf, String)], existing: &[Value]) -> Vec<Value> {
+    assigned
+        .iter()
+        .filter_map(|(repo, id)| {
+            let d = existing
+                .iter()
+                .find(|d| d.get("id").and_then(|v| v.as_str()) == Some(id.as_str()))?;
+            let s = |k: &str| d.get(k).and_then(|v| v.as_str());
+            if s("source") == Some("crawler")
+                || s("status") == Some("stub")
+                || s("kind_of") != Some("project")
+                || s("path").is_some()
+            {
+                return None;
+            }
+            Some(json!({ "id": id, "path": repo.to_string_lossy() }))
+        })
+        .collect()
+}
+
+/// Status patches for agent-owned project entities whose directory is gone.
+pub fn archive_patches(existing: &[Value]) -> Vec<Value> {
+    existing
+        .iter()
+        .filter(|d| d.get("kind_of").and_then(|s| s.as_str()) == Some("project"))
+        .filter(|d| d.get("source").and_then(|s| s.as_str()) != Some("crawler"))
+        .filter(|d| d.get("status").and_then(|s| s.as_str()) != Some("archived"))
+        .filter_map(|d| {
+            let path = d.get("path")?.as_str()?;
+            if Path::new(path).exists() {
+                return None;
+            }
+            Some(json!({ "id": d.get("id")?.as_str()?, "status": "archived" }))
+        })
+        .collect()
+}
+
+/// A qualifying file found by the walk, ingested once project ids are known.
+struct Candidate {
+    path: PathBuf,
+    ty: MemoryType,
+    scope: String,
+}
+
 /// Run a full scan of all roots: index/update matching files and remove
 /// documents for files that have disappeared. With `reset`, every crawler
 /// document is dropped first so the index is rebuilt from scratch.
@@ -272,23 +519,17 @@ pub async fn scan(cfg: &Config, svc: &MemoryService, reset: bool) -> Result<Craw
 
 async fn scan_with(crawler: &Crawler, svc: &MemoryService, reset: bool) -> Result<CrawlSummary> {
     let mut summary = CrawlSummary::default();
-
-    // The crawler's stored state, loaded in a few paged requests rather than
-    // one GET per file.
-    let state: HashMap<String, (String, i64)> = if reset {
+    let state: HashMap<String, CrawledDoc> = if reset {
         summary.deleted = svc.forget_all_crawled().await?;
         HashMap::new()
     } else {
         svc.crawled_state().await?
     };
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut batch: Vec<MemoryItem> = Vec::new();
-    let mut scope_cache = ScopeCache::new();
+    // 1. Walk every root, collecting qualifying files and git repositories.
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut git_roots: Vec<PathBuf> = Vec::new();
-    const BATCH: usize = 200;
-
-    // 1. Project roots.
+    let mut scope_cache = ScopeCache::new();
     for root in &crawler.roots {
         let walker = WalkDir::new(root).follow_links(false).into_iter();
         for entry in
@@ -320,23 +561,13 @@ async fn scan_with(crawler: &Crawler, svc: &MemoryService, reset: bool) -> Resul
                 continue;
             }
             let scope = crawler.project_scope(root, path, &mut scope_cache);
-            ingest(
-                svc,
-                path,
+            candidates.push(Candidate {
+                path: path.to_path_buf(),
                 ty,
                 scope,
-                &state,
-                &mut seen,
-                &mut batch,
-                &mut summary,
-            );
-            if batch.len() >= BATCH {
-                flush(svc, &mut batch, &mut summary).await;
-            }
+            });
         }
     }
-
-    // 2. Agent knowledge roots (memories, global rules).
     let slugs: HashMap<String, PathBuf> = git_roots
         .iter()
         .map(|d| (claude_slug(&d.to_string_lossy()), d.clone()))
@@ -360,25 +591,90 @@ async fn scan_with(crawler: &Crawler, svc: &MemoryService, reset: bool) -> Resul
                 continue;
             }
             let scope = crawler.knowledge_scope(path, &slugs);
-            ingest(
-                svc,
-                path,
+            candidates.push(Candidate {
+                path: path.to_path_buf(),
                 ty,
                 scope,
-                &state,
-                &mut seen,
-                &mut batch,
-                &mut summary,
-            );
-            if batch.len() >= BATCH {
-                flush(svc, &mut batch, &mut summary).await;
-            }
+            });
         }
+    }
+
+    // 2. Give every repository a project entity id. Every entity is
+    //    consulted, so a repository never takes an id an agent uses for
+    //    something else. A failed fetch aborts the scan: guessing here would
+    //    overwrite agent-owned entities.
+    let existing_projects = svc
+        .client()
+        .fetch_docs(
+            "type = 'entity'",
+            &["id", "path", "source", "status", "kind_of"],
+        )
+        .await?;
+    let (taken, blocked) = project_claims(&existing_projects);
+    git_roots.sort();
+    let assigned = assign_project_ids(&git_roots, &taken, &blocked);
+    let by_scope: HashMap<String, String> = assigned
+        .iter()
+        .map(|(p, id)| (p.to_string_lossy().to_string(), id.clone()))
+        .collect();
+    if let Ok(mut m) = crawler.projects.write() {
+        *m = by_scope.clone();
+    }
+
+    // 3. Files.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut batch: Vec<MemoryItem> = Vec::new();
+    let mut patches: Vec<Value> = Vec::new();
+    const BATCH: usize = 200;
+    for c in &candidates {
+        let entities: Vec<String> = by_scope.get(&c.scope).cloned().into_iter().collect();
+        ingest(
+            svc,
+            c,
+            entities,
+            &state,
+            &mut seen,
+            &mut batch,
+            &mut patches,
+            &mut summary,
+        );
+        if batch.len() >= BATCH {
+            flush(svc, &mut batch, &mut summary).await;
+        }
+    }
+
+    // 4. Project entities. Agent-owned ones (source ≠ crawler) are never
+    //    overwritten; they are not in `state`, so stale deletion skips them too.
+    let now = crate::memory::model::now_secs();
+    for (repo, id) in &crawler_writable(&assigned, &existing_projects) {
+        let readme = candidates
+            .iter()
+            .find(|c| {
+                c.ty == MemoryType::ProjectOverview && c.path.parent() == Some(repo.as_path())
+            })
+            .and_then(|c| std::fs::read_to_string(&c.path).ok());
+        let prev = state.get(id);
+        let item =
+            project_entity_item(id, repo, readme.as_deref(), prev.map(|p| p.created_at), now);
+        seen.insert(id.clone());
+        if prev.map(|p| p.hash == item.content_hash).unwrap_or(false) {
+            summary.skipped += 1;
+            continue;
+        }
+        batch.push(item);
+        summary.indexed += 1;
     }
     flush(svc, &mut batch, &mut summary).await;
 
-    // 3. Deletions: every stored crawler doc that no qualifying file produced
-    //    this pass (moved, deleted, or no longer matching the rules).
+    // 5. Link-only updates, adopted and archived projects.
+    patches.extend(adopt_patches(&assigned, &existing_projects));
+    patches.extend(archive_patches(&existing_projects));
+    if let Err(e) = svc.patch(&patches).await {
+        tracing::warn!("patching {} crawled docs failed: {e}", patches.len());
+        summary.errors += patches.len();
+    }
+
+    // 6. Deletions: stored crawler docs no qualifying file produced this pass.
     let stale: Vec<String> = state
         .keys()
         .filter(|id| !seen.contains(*id))
@@ -398,10 +694,6 @@ async fn scan_with(crawler: &Crawler, svc: &MemoryService, reset: bool) -> Resul
         summary.deleted,
         summary.errors
     );
-
-    // Record one rolled-up history event per crawl — but only when something
-    // actually changed, so periodic reconciles that find nothing don't flood
-    // the audit log.
     if summary.indexed + summary.deleted + summary.errors > 0 {
         let detail = format!(
             "{} indexed, {} skipped, {} deleted, {} errors",
@@ -414,35 +706,50 @@ async fn scan_with(crawler: &Crawler, svc: &MemoryService, reset: bool) -> Resul
     Ok(summary)
 }
 
-/// Read one qualifying file and queue it for upsert if its content changed.
+/// Read one qualifying file and queue it: a full upsert when its content
+/// changed, a link-only patch when only its project changed.
 #[allow(clippy::too_many_arguments)]
 fn ingest(
     svc: &MemoryService,
-    path: &Path,
-    ty: crate::memory::MemoryType,
-    scope: String,
-    state: &HashMap<String, (String, i64)>,
+    c: &Candidate,
+    entities: Vec<String>,
+    state: &HashMap<String, CrawledDoc>,
     seen: &mut HashSet<String>,
     batch: &mut Vec<MemoryItem>,
+    patches: &mut Vec<Value>,
     summary: &mut CrawlSummary,
 ) {
-    let path_str = path.to_string_lossy().to_string();
+    let path_str = c.path.to_string_lossy().to_string();
     let id = path_id(&path_str);
-    let content = match std::fs::read_to_string(path) {
-        Ok(c) if !c.trim().is_empty() => c,
+    let content = match std::fs::read_to_string(&c.path) {
+        Ok(text) if !text.trim().is_empty() => text,
         _ => {
             summary.skipped += 1; // empty, binary, or unreadable
             return;
         }
     };
     seen.insert(id.clone());
-    let existing = state.get(&id).map(|(h, c)| (h.as_str(), *c));
-    match svc.prepare_crawled(&path_str, content, ty, scope, None, existing) {
+    let prev = state.get(&id);
+    let existing = prev.map(|p| (p.hash.as_str(), p.created_at));
+    match svc.prepare_crawled(
+        &path_str,
+        content,
+        c.ty,
+        c.scope.clone(),
+        None,
+        existing,
+        entities.clone(),
+    ) {
         Some(item) => {
             batch.push(item);
             summary.indexed += 1;
         }
-        None => summary.skipped += 1,
+        None => {
+            if prev.map(|p| p.entities != entities).unwrap_or(false) {
+                patches.push(json!({ "id": id, "entities": entities }));
+            }
+            summary.skipped += 1;
+        }
     }
 }
 
@@ -456,7 +763,8 @@ pub async fn index_one(crawler: &Crawler, svc: &MemoryService, path: &Path) -> R
         _ => return Ok(false),
     };
     let scope = crawler.scope_for(path);
-    svc.upsert_crawled(&path.to_string_lossy(), content, ty, scope, None)
+    let entities = crawler.project_ids_for(&scope);
+    svc.upsert_crawled(&path.to_string_lossy(), content, ty, scope, None, entities)
         .await
 }
 
@@ -708,5 +1016,160 @@ mod tests {
             c.knowledge_scope(Path::new("/Users/q/.codex/memories/MEMORY.md"), &slugs),
             "global"
         );
+    }
+
+    #[test]
+    fn readme_headline_takes_heading_and_first_paragraph() {
+        let md = "# memd\n\n[![CI](x)](y)\n<div>\n\nUniversal local memory\nfor every LLM tool.\n\n## Install\n";
+        assert_eq!(
+            readme_headline(md),
+            "memd — Universal local memory for every LLM tool."
+        );
+        assert_eq!(readme_headline("Just text."), "Just text.");
+        assert_eq!(readme_headline("# Only a title\n"), "Only a title");
+        assert_eq!(readme_headline(""), "");
+        let long = format!("# T\n\n{}", "word ".repeat(200));
+        assert!(readme_headline(&long).chars().count() <= 400);
+    }
+
+    #[test]
+    fn project_ids_resolve_collisions_and_keep_existing_claims() {
+        let taken = HashMap::from([(
+            "entity_console".to_string(),
+            PathBuf::from("/p/cloud/console"),
+        )]);
+        let repos = vec![
+            PathBuf::from("/p/cloud/console"),
+            PathBuf::from("/p/demos/console"),
+            PathBuf::from("/p/memd"),
+            PathBuf::from("/q/demos/console"),
+        ];
+        let got: HashMap<PathBuf, String> = assign_project_ids(&repos, &taken, &HashSet::new())
+            .into_iter()
+            .collect();
+        assert_eq!(
+            got[&PathBuf::from("/p/cloud/console")],
+            "entity_console",
+            "existing claim kept"
+        );
+        assert_eq!(
+            got[&PathBuf::from("/p/demos/console")],
+            "entity_demos-console"
+        );
+        assert_eq!(
+            got[&PathBuf::from("/q/demos/console")],
+            "entity_demos-console-2"
+        );
+        assert_eq!(got[&PathBuf::from("/p/memd")], "entity_memd");
+    }
+
+    #[test]
+    fn project_entity_items_are_crawler_owned_projects() {
+        let it = project_entity_item(
+            "entity_memd",
+            Path::new("/p/memd"),
+            Some("# memd\n\nMemory daemon."),
+            Some(5),
+            9,
+        );
+        assert_eq!(it.r#type, "entity");
+        assert_eq!(it.source, "crawler");
+        assert_eq!(it.scope, "/p/memd");
+        assert_eq!(it.created_at, 5);
+        assert_eq!(it.knowledge.kind_of.as_deref(), Some("project"));
+        assert_eq!(it.knowledge.path.as_deref(), Some("/p/memd"));
+        assert_eq!(it.knowledge.name.as_deref(), Some("memd"));
+        assert_eq!(it.summary.as_deref(), Some("memd — Memory daemon."));
+        let other = project_entity_item("entity_memd", Path::new("/p/memd"), None, None, 9);
+        assert_ne!(it.content_hash, other.content_hash);
+    }
+
+    #[test]
+    fn crawler_never_writes_a_project_an_agent_took_over() {
+        let assigned = vec![
+            (PathBuf::from("/p/memd"), "entity_memd".to_string()),
+            (PathBuf::from("/p/lab"), "entity_lab".to_string()),
+            (PathBuf::from("/p/new"), "entity_new".to_string()),
+        ];
+        let existing = vec![
+            serde_json::json!({ "id": "entity_memd", "path": "/p/memd", "source": "mcp" }),
+            serde_json::json!({ "id": "entity_lab", "path": "/p/lab", "source": "crawler" }),
+        ];
+        let ids: Vec<String> = crawler_writable(&assigned, &existing)
+            .into_iter()
+            .map(|(_, id)| id)
+            .collect();
+        assert_eq!(ids, vec!["entity_lab", "entity_new"]);
+    }
+
+    #[test]
+    fn only_agent_owned_projects_with_missing_paths_are_archived() {
+        let existing = vec![
+            serde_json::json!({ "kind_of": "project", "id": "entity_gone", "path": "/definitely/missing/xyz", "source": "mcp" }),
+            serde_json::json!({ "kind_of": "project", "id": "entity_done", "path": "/definitely/missing/xyz", "source": "mcp", "status": "archived" }),
+            serde_json::json!({ "kind_of": "project", "id": "entity_crawled", "path": "/definitely/missing/xyz", "source": "crawler" }),
+            serde_json::json!({ "kind_of": "project", "id": "entity_here", "path": "/", "source": "cli" }),
+        ];
+        assert_eq!(
+            archive_patches(&existing),
+            vec![serde_json::json!({ "id": "entity_gone", "status": "archived" })]
+        );
+    }
+
+    #[test]
+    fn agent_entities_block_their_id_for_repositories() {
+        // Review Critical 1: an agent's company must never become a crawled project.
+        let existing = vec![
+            serde_json::json!({ "id": "entity_console", "kind_of": "company", "source": "mcp" }),
+        ];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[PathBuf::from("/p/demos/console")], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_demos-console");
+        assert!(
+            crawler_writable(&got, &existing)
+                .iter()
+                .all(|(_, id)| id != "entity_console")
+        );
+    }
+
+    #[test]
+    fn stubs_are_adopted_and_filled_by_the_crawler() {
+        let existing = vec![
+            serde_json::json!({ "id": "entity_memd", "kind_of": "concept", "source": "mcp", "status": "stub" }),
+        ];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[PathBuf::from("/p/memd")], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_memd");
+        assert_eq!(crawler_writable(&got, &existing).len(), 1);
+    }
+
+    #[test]
+    fn agent_projects_without_a_path_are_adopted_not_overwritten() {
+        // Review Important 2: the crawler gives an agent's project its path.
+        let existing =
+            vec![serde_json::json!({ "id": "entity_memd", "kind_of": "project", "source": "mcp" })];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[PathBuf::from("/p/memd")], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_memd");
+        assert!(crawler_writable(&got, &existing).is_empty());
+        assert_eq!(
+            adopt_patches(&got, &existing),
+            vec![serde_json::json!({ "id": "entity_memd", "path": "/p/memd" })]
+        );
+    }
+
+    #[test]
+    fn a_moved_repository_reclaims_its_id() {
+        // Review Important 5: a crawled project whose old path is gone frees its id.
+        let dir = tempfile::tempdir().unwrap();
+        let new = dir.path().join("b/foo");
+        std::fs::create_dir_all(&new).unwrap();
+        let old = dir.path().join("a/foo").to_string_lossy().to_string();
+        let existing = vec![
+            serde_json::json!({ "id": "entity_foo", "kind_of": "project", "source": "crawler", "path": old }),
+        ];
+        let (taken, blocked) = project_claims(&existing);
+        let got = assign_project_ids(&[new], &taken, &blocked);
+        assert_eq!(got[0].1, "entity_foo");
     }
 }

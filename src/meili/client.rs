@@ -166,16 +166,19 @@ impl MeiliClient {
         self.create_index().await;
 
         let settings = json!({
-            "searchableAttributes": ["title", "content", "summary", "tags"],
+            "searchableAttributes": ["title", "name", "aliases_display", "content", "summary", "tags"],
             "filterableAttributes": [
-                "type", "tags", "scope", "source", "source_path",
-                "content_hash", "created_at", "updated_at"
+                "id", "type", "tags", "scope", "source", "source_path",
+                "content_hash", "created_at", "updated_at",
+                "name_key", "aliases", "kind_of", "status", "owner", "supersedes", "entities"
             ],
             "sortableAttributes": ["created_at", "updated_at", "last_accessed_at"],
             "embedders": {
                 "default": {
                     "source": embedder_source,
                     "model": embedder_model,
+                    // Unchanged on purpose: every field named here must exist
+                    // on every document, or the engine fails the task.
                     "documentTemplate": "{{doc.title}} {{doc.content}} {{doc.tags}}"
                 }
             }
@@ -191,6 +194,21 @@ impl MeiliClient {
             "searchableAttributes": ["title", "detail", "memory_id"],
             "filterableAttributes": ["action", "type", "scope", "source", "memory_id", "ts"],
             "sortableAttributes": ["ts"],
+        });
+        self.apply_settings(&settings).await
+    }
+
+    /// Ensure the `memory_relations` index exists with its settings. No
+    /// embedder. Idempotent; safe on every daemon start.
+    pub async fn ensure_relations_index(&self) -> Result<()> {
+        self.create_index().await;
+        let settings = json!({
+            "searchableAttributes": ["note", "predicate"],
+            "filterableAttributes": [
+                "id", "subject", "predicate", "object", "source", "source_client",
+                "scope", "created_at", "updated_at"
+            ],
+            "sortableAttributes": ["created_at", "updated_at"],
         });
         self.apply_settings(&settings).await
     }

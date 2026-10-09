@@ -5,5 +5,5 @@ pub mod classify;
 pub mod model;
 pub mod service;
 
-pub use model::{MemoryItem, MemoryType, Source};
+pub use model::{Knowledge, MemoryItem, MemoryType, Source};
 pub use service::{GetRequest, MemoryService, ProjectionOptions, QueryResult, SaveRequest};
