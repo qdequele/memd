@@ -7,6 +7,8 @@ mod hooks;
 mod mcp;
 mod skills;
 
+pub use hooks::HookKind;
+
 use crate::config::Config;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -23,6 +25,31 @@ pub use skills::{
 /// The HTTP MCP endpoint every agent registers against.
 pub fn mcp_url(cfg: &Config) -> String {
     format!("http://{}:{}/mcp", cfg.mcp.host, cfg.mcp.port)
+}
+
+/// Every existing directory in which a supported agent keeps knowledge on disk
+/// (memories, global rules), regardless of whether memd is wired into that
+/// agent. The crawler scans these in addition to the configured roots so that
+/// one agent's memory is visible to all the others.
+pub fn knowledge_roots() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = registry()
+        .into_iter()
+        .flat_map(|a| a.knowledge)
+        .filter(|p| p.is_dir())
+        .collect();
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// The knowledge roots of one agent (by id), e.g. Claude Code's
+/// `~/.claude/projects`. Empty for unknown ids.
+pub fn knowledge_roots_of(agent_id: &str) -> Vec<PathBuf> {
+    registry()
+        .into_iter()
+        .filter(|a| a.id == agent_id)
+        .flat_map(|a| a.knowledge)
+        .collect()
 }
 
 /// What `setup` should do for one agent, given its current state, whether the
@@ -97,9 +124,14 @@ pub struct Agent {
     pub detect: DetectRule,
     mcp: McpKind,
     pub directives: Option<PathBuf>,
-    pub hooks: bool,
+    /// Which hook dialect this agent speaks, if it supports lifecycle hooks.
+    pub hooks: Option<HookKind>,
     /// Whether memd ships invokable skills into this agent (Claude Code only).
     pub skills: bool,
+    /// Directories outside any project where this agent keeps knowledge on
+    /// disk (its own memories, global rules). The crawler indexes them so every
+    /// other agent can see them. Only existing directories are scanned.
+    pub knowledge: Vec<PathBuf>,
 }
 
 impl Agent {
@@ -148,8 +180,10 @@ impl Agent {
         if let Some(path) = &self.directives {
             directives::upsert_directive(path)?;
         }
-        if self.hooks && install_hooks {
-            let _ = hooks::install_claude_hooks(bin);
+        if let Some(kind) = self.hooks
+            && install_hooks
+        {
+            let _ = hooks::install_hooks(kind, bin);
         }
         // Skills are inert until invoked, so they're installed regardless of the
         // `--no-hooks` opt-out (which is about the auto-running session hooks).
@@ -174,8 +208,8 @@ impl Agent {
         if let Some(path) = &self.directives {
             directives::remove_directive(path)?;
         }
-        if self.hooks {
-            let _ = hooks::remove_claude_hooks();
+        if let Some(kind) = self.hooks {
+            let _ = hooks::remove_hooks(kind);
         }
         if self.skills {
             let _ = skills::remove_claude_skills();
@@ -221,8 +255,10 @@ pub fn registry() -> Vec<Agent> {
             detect: DetectRule::CliOnPath("claude"),
             mcp: McpKind::ClaudeCli,
             directives: Some(h.join(".claude/CLAUDE.md")),
-            hooks: true,
+            hooks: Some(HookKind::ClaudeCode),
             skills: true,
+            // Auto-memory: ~/.claude/projects/<slug>/memory/*.md
+            knowledge: vec![h.join(".claude/projects")],
         },
         Agent {
             id: "codex",
@@ -232,8 +268,10 @@ pub fn registry() -> Vec<Agent> {
                 path: h.join(".codex/config.toml"),
             },
             directives: Some(h.join(".codex/AGENTS.md")),
-            hooks: false,
+            hooks: Some(HookKind::Codex),
             skills: false,
+            // Built-in memories (opt-in feature): ~/.codex/memories/
+            knowledge: vec![h.join(".codex/memories")],
         },
         Agent {
             id: "gemini-cli",
@@ -246,8 +284,9 @@ pub fn registry() -> Vec<Agent> {
                 extra: &[],
             },
             directives: Some(h.join(".gemini/GEMINI.md")),
-            hooks: false,
+            hooks: Some(HookKind::GeminiCli),
             skills: false,
+            knowledge: vec![],
         },
         Agent {
             id: "cursor",
@@ -259,9 +298,11 @@ pub fn registry() -> Vec<Agent> {
                 url_key: "url",
                 extra: &[],
             },
+            // Cursor's global rules live in its settings UI, not a file.
             directives: None,
-            hooks: false,
+            hooks: None,
             skills: false,
+            knowledge: vec![],
         },
         Agent {
             id: "windsurf",
@@ -273,9 +314,11 @@ pub fn registry() -> Vec<Agent> {
                 url_key: "serverUrl",
                 extra: &[],
             },
-            directives: None,
-            hooks: false,
+            directives: Some(h.join(".codeium/windsurf/memories/global_rules.md")),
+            hooks: None,
             skills: false,
+            // Windsurf memories + global rules
+            knowledge: vec![h.join(".codeium/windsurf/memories")],
         },
         Agent {
             id: "cline",
@@ -287,9 +330,11 @@ pub fn registry() -> Vec<Agent> {
                 url_key: "url",
                 extra: &[("type", "streamableHttp")],
             },
-            directives: None,
-            hooks: false,
+            directives: Some(h.join("Documents/Cline/Rules/memd.md")),
+            hooks: None,
             skills: false,
+            // Cline global rules
+            knowledge: vec![h.join("Documents/Cline/Rules")],
         },
         Agent {
             id: "zed",
@@ -301,9 +346,11 @@ pub fn registry() -> Vec<Agent> {
                 url_key: "url",
                 extra: &[],
             },
+            // Zed's rules library lives in its UI; it reads .rules/AGENTS.md on disk.
             directives: None,
-            hooks: false,
+            hooks: None,
             skills: false,
+            knowledge: vec![],
         },
     ]
 }

@@ -38,21 +38,25 @@ pub async fn handle_message(svc: &MemoryService, msg: Value) -> Option<Value> {
 /// (Claude Code, etc.) via the `initialize` response. This is memd's strongest
 /// in-protocol lever for getting agents to treat it as primary memory.
 const SERVER_INSTRUCTIONS: &str = "\
-memd is your persistent, cross-tool long-term memory — a single local store \
-shared with every other LLM tool on this machine. Treat it as the source of \
-truth for what you remember across sessions, and use it proactively:
+memd is your persistent, cross-tool long-term memory: a single local store \
+shared with every other LLM tool on this machine (Claude Code, Codex, Gemini \
+CLI, Cursor, Windsurf, Cline, Zed). What one tool saves, all the others recall.
 
-- BEFORE starting a task or answering from assumed context, call `get_memory` \
-with the user's goal (set `scope` to the current project path when relevant) \
-to load prior decisions, preferences, and facts. Prefer recalling from memd \
-over asking the user to repeat themselves.
-- WHEN you learn something durable — a decision, a preference, a fact about the \
-user or project, or a reusable solution — call `save_memory` right away so \
-other tools and future sessions inherit it.
+- RECALL FIRST: before starting a task or answering from assumed context, call \
+`get_memory` with the user's goal and `scope` set to the project root path. \
+Recall includes the project's parent scopes and `global`. Prefer recalling over \
+asking the user to repeat themselves.
+- SAVE WHAT OUTLIVES THE SESSION: decisions (with the why), user preferences, \
+stable facts about a project, reusable solutions. One fact per memory, \
+self-contained, dated when it matters. Set `type` (decision, preference, fact, \
+task) and `scope` (project root path, or `global` for user-wide truths).
+- DO NOT SAVE what is already on disk (code, README, instruction files, docs) \
+or what only matters to the current conversation. Search before saving and \
+`update_memory` a near-duplicate instead of adding another.
 - Results are lightweight rows with a snippet; call `read_memory(id)` for the \
-full text, `list_memories` to browse, and `stats` for an overview.
+full text, `list_memories` to browse, `stats` for an overview.
 
-Do not treat memd as optional scratch space: it is the shared memory layer.";
+memd is the shared memory layer, not optional scratch space.";
 
 fn initialize_result() -> Value {
     json!({
@@ -75,7 +79,7 @@ fn tool_defs() -> Value {
                     "content": { "type": "string", "description": "The memory text." },
                     "type": { "type": "string", "description": "fact, preference, decision, task, project_overview, agent_instruction, file_annotation, code_note, reference." },
                     "tags": { "type": "array", "items": { "type": "string" } },
-                    "scope": { "type": "string", "description": "'global' or a path prefix (e.g. ~/Projects/Foo)." },
+                    "scope": { "type": "string", "description": "'global' (user-wide) or the absolute path of the project root the memory belongs to (e.g. ~/Projects/foo)." },
                     "title": { "type": "string" }
                 },
                 "required": ["content"]
@@ -91,7 +95,7 @@ fn tool_defs() -> Value {
                     "limit": { "type": "integer", "description": "Max rows (default 10)." },
                     "offset": { "type": "integer", "description": "Paging offset." },
                     "type": { "type": "string" },
-                    "scope": { "type": "string" },
+                    "scope": { "type": "string", "description": "Project root path. Matches memories in this scope, its parent scopes, its sub-scopes, and 'global'." },
                     "since": { "type": "integer", "description": "Unix seconds lower bound on created_at." },
                     "until": { "type": "integer", "description": "Unix seconds upper bound on created_at." },
                     "semantic_ratio": { "type": "number", "description": "0.0 keyword .. 1.0 vector." },
@@ -252,6 +256,7 @@ async fn get_memory(svc: &MemoryService, args: Value) -> anyhow::Result<Value> {
             .get("semantic_ratio")
             .and_then(|r| r.as_f64())
             .map(|f| f as f32),
+        extra_filters: Vec::new(),
     };
     let opts = projection_opts(&args, ProjectionOptions::search_default());
     let result = svc.get(req, &opts).await?;

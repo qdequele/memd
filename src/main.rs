@@ -129,11 +129,20 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Print relevant memories as markdown (for a SessionStart hook).
+    /// Print relevant memories for a session-start hook. Reads the hook's JSON
+    /// payload on stdin (when piped) to pick up the working directory.
     Context {
-        /// Bias toward memories in this scope (e.g. the project path).
+        /// Project scope (defaults to `cwd` from the hook payload, else the
+        /// current directory).
         #[arg(long)]
         scope: Option<String>,
+        /// The agent invoking the hook (claude-code, codex, gemini-cli, …).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Output format: `text` (plain markdown on stdout) or `json`
+        /// (`hookSpecificOutput.additionalContext`, as Gemini CLI expects).
+        #[arg(long, default_value = "text")]
+        format: String,
         /// Optional query to rank by relevance instead of recency.
         #[arg(long)]
         query: Option<String>,
@@ -141,9 +150,13 @@ enum Command {
         #[arg(long, default_value_t = 8)]
         limit: usize,
     },
-    /// Conservatively capture a finished session turn (for a Stop hook).
-    /// Reads the hook JSON payload on stdin.
-    Capture,
+    /// Conservatively capture a finished session turn (for a Stop /
+    /// AfterAgent hook). Reads the hook JSON payload on stdin.
+    Capture {
+        /// The agent invoking the hook (claude-code, codex, gemini-cli, …).
+        #[arg(long)]
+        agent: Option<String>,
+    },
     /// Inject/remove memd usage directives in agent instruction files.
     Directives {
         #[command(subcommand)]
@@ -157,9 +170,15 @@ enum Command {
     /// One-command install: relocate the binary, start the daemon, register
     /// with detected agents, install directives, and wire up hooks.
     Setup {
-        /// Skip wiring the Claude Code SessionStart/Stop hooks.
+        /// Skip wiring the session-start / end-of-turn hooks.
         #[arg(long)]
         no_hooks: bool,
+        /// Explicit, comma-separated list of agent ids to connect
+        /// (claude-code, codex, gemini-cli, cursor, windsurf, cline, zed)
+        /// instead of the interactive picker. Agents not listed are left as
+        /// they are.
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
     },
     /// Diagnose Meilisearch / model / config issues.
     Doctor {
@@ -178,7 +197,11 @@ enum Command {
 #[derive(Subcommand)]
 enum CrawlAction {
     /// Run a one-off crawl of the configured roots.
-    Run,
+    Run {
+        /// Drop every crawled document first and rebuild from scratch.
+        #[arg(long)]
+        reset: bool,
+    },
     /// Show crawl status.
     Status,
     /// Print the active crawl configuration.
@@ -244,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
         } => cli::history(action, r#type, scope, since, limit).await,
         Command::Crawl { action } => match action {
-            CrawlAction::Run => cli::crawl_run().await,
+            CrawlAction::Run { reset } => cli::crawl_run(reset).await,
             CrawlAction::Status => cli::crawl_status().await,
             CrawlAction::Config => cli::crawl_config().await,
         },
@@ -263,10 +286,12 @@ async fn main() -> anyhow::Result<()> {
         },
         Command::Context {
             scope,
+            agent,
+            format,
             query,
             limit,
-        } => cli::context(scope, query, limit).await,
-        Command::Capture => cli::capture().await,
+        } => cli::context(scope, agent, &format, query, limit).await,
+        Command::Capture { agent } => cli::capture(agent).await,
         Command::Directives { action } => match action {
             DirectivesAction::Install => cli::directives_install(),
             DirectivesAction::Uninstall => cli::directives_uninstall(),
@@ -275,7 +300,7 @@ async fn main() -> anyhow::Result<()> {
             SkillsAction::Install => cli::skills_install(),
             SkillsAction::Uninstall => cli::skills_uninstall(),
         },
-        Command::Setup { no_hooks } => cli::setup(no_hooks).await,
+        Command::Setup { no_hooks, agents } => cli::setup(no_hooks, agents).await,
         Command::Doctor { fix } => cli::doctor(fix).await,
         Command::Update { check } => cli::update(check).await,
     }

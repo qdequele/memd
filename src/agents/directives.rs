@@ -13,14 +13,20 @@ pub fn directive_block() -> String {
     format!(
         "{DIRECTIVE_START}\n\
 ## Memory (memd)\n\
-`memd` is your persistent, cross-tool long-term memory — an always-on local MCP \
-server shared with all of your LLM tools.\n\
-- At the start of a task, call `get_memory` (set `scope` to the project path) to \
-load prior decisions, preferences, and facts before acting — don't ask the user \
-to repeat context you can recall.\n\
-- When you learn something durable (a decision, preference, fact, or reusable \
-solution), call `save_memory`.\n\
-- Use `read_memory(id)` for the full text and `list_memories` to browse.\n\
+`memd` is your persistent, cross-tool long-term memory: one always-on local MCP \
+server shared by every LLM tool on this machine (Claude Code, Codex, Gemini CLI, \
+Cursor, Windsurf, Cline, Zed). What one tool saves, all the others recall.\n\
+- **Recall first.** At the start of a task call `get_memory` with the goal and \
+`scope` set to the project root (recall includes parent scopes and `global`). \
+Don't ask the user to repeat what is already remembered.\n\
+- **Save what outlives the session**: decisions (with the why), user preferences, \
+stable facts about a project, reusable fixes. One fact per memory, self-contained, \
+dated when it matters. Set `type` (`decision`, `preference`, `fact`, `task`) and \
+`scope` (project root path, or `global`).\n\
+- **Don't save** what is already on disk (code, README, instruction files) or \
+only matters to the current conversation. Search before saving; `update_memory` a \
+near-duplicate instead of adding another.\n\
+- `read_memory(id)` returns the full text; `list_memories` browses.\n\
 {DIRECTIVE_END}"
     )
 }

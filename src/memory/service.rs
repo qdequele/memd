@@ -11,6 +11,7 @@ use crate::meili::MeiliClient;
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 /// A request to persist a memory.
 #[derive(Debug, Clone, Default)]
@@ -36,6 +37,9 @@ pub struct GetRequest {
     pub since: Option<i64>,
     pub until: Option<i64>,
     pub semantic_ratio: Option<f32>,
+    /// Additional raw Meilisearch filter clauses, ANDed with the rest. Used by
+    /// `memd context` to shape what gets injected into a session.
+    pub extra_filters: Vec<String>,
 }
 
 /// Controls how much of each memory a query returns. The funnel is:
@@ -189,7 +193,7 @@ impl MemoryService {
             summary: None,
             r#type: ty.to_string(),
             tags: req.tags,
-            scope: req.scope.unwrap_or_else(|| "global".to_string()),
+            scope: normalize_scope(req.scope.as_deref()),
             source: source.as_str().to_string(),
             source_path: req.source_path,
             source_client: req.source_client,
@@ -213,38 +217,41 @@ impl MemoryService {
     }
 
     /// Build the document for a crawled file, or `None` if it is unchanged
-    /// (same content hash) and therefore needs no re-embedding. Preserves the
-    /// original `created_at` when the document already exists.
-    pub async fn prepare_crawled(
+    /// (same content hash) and therefore needs no re-embedding. `existing` is
+    /// the stored `(content_hash, created_at)` for this path, if any; the
+    /// original `created_at` is preserved on re-index.
+    pub fn prepare_crawled(
         &self,
         source_path: &str,
         content: String,
         ty: MemoryType,
         scope: String,
         title: Option<String>,
-    ) -> Result<Option<MemoryItem>> {
+        existing: Option<(&str, i64)>,
+    ) -> Option<MemoryItem> {
         let id = path_id(source_path);
         let hash = content_hash(&content);
         let now = now_secs();
 
         let mut created_at = now;
-        if let Some(existing) = self.client.get_doc(&id).await? {
-            if existing.get("content_hash").and_then(|h| h.as_str()) == Some(hash.as_str()) {
-                return Ok(None);
+        if let Some((old_hash, old_created)) = existing {
+            if old_hash == hash {
+                return None;
             }
-            if let Some(c) = existing.get("created_at").and_then(|c| c.as_i64()) {
-                created_at = c;
-            }
+            created_at = old_created;
         }
 
-        Ok(Some(MemoryItem {
+        let title = title
+            .or_else(|| frontmatter_title(&content))
+            .or_else(|| Some(file_title(source_path)));
+        Some(MemoryItem {
             id,
             content,
-            title: title.or_else(|| Some(file_title(source_path))),
+            title,
             summary: None,
             r#type: ty.to_string(),
             tags: vec![],
-            scope,
+            scope: normalize_scope(Some(&scope)),
             source: Source::Crawler.as_str().to_string(),
             source_path: Some(source_path.to_string()),
             source_client: None,
@@ -252,7 +259,30 @@ impl MemoryService {
             updated_at: now,
             last_accessed_at: None,
             content_hash: hash,
-        }))
+        })
+    }
+
+    /// Load the crawler's stored state: `path_id → (content_hash, created_at)`
+    /// for every crawler document, in a few paged requests.
+    pub async fn crawled_state(&self) -> Result<HashMap<String, (String, i64)>> {
+        let docs = self
+            .client
+            .fetch_docs("source = 'crawler'", &["id", "content_hash", "created_at"])
+            .await?;
+        Ok(docs
+            .into_iter()
+            .filter_map(|d| {
+                let id = d.get("id")?.as_str()?.to_string();
+                let hash = d.get("content_hash")?.as_str()?.to_string();
+                let created = d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0);
+                Some((id, (hash, created)))
+            })
+            .collect())
+    }
+
+    /// Delete every crawler-sourced document (the next scan rebuilds them).
+    pub async fn forget_all_crawled(&self) -> Result<usize> {
+        self.client.delete_by_filter("source = 'crawler'").await
     }
 
     /// Upsert a single crawled file (used by the watcher). Skips unchanged
@@ -265,10 +295,14 @@ impl MemoryService {
         scope: String,
         title: Option<String>,
     ) -> Result<bool> {
-        match self
-            .prepare_crawled(source_path, content, ty, scope, title)
-            .await?
-        {
+        let existing = self.client.get_doc(&path_id(source_path)).await?;
+        let existing = existing.as_ref().and_then(|d| {
+            Some((
+                d.get("content_hash")?.as_str()?,
+                d.get("created_at").and_then(|c| c.as_i64()).unwrap_or(0),
+            ))
+        });
+        match self.prepare_crawled(source_path, content, ty, scope, title, existing) {
             Some(item) => {
                 self.client.upsert(&item).await?;
                 Ok(true)
@@ -298,14 +332,33 @@ impl MemoryService {
         });
         apply_projection(&mut body, opts);
 
-        let filters = build_filters(&req);
+        let result = self.run_filtered(body, &req, opts).await?;
+        self.bump_accessed(&result.hits).await;
+        Ok(result)
+    }
+
+    /// Run `body` with the request's filters. Sub-scope matching uses
+    /// `STARTS WITH`, which older engines reject; on that error the query is
+    /// retried with exact/ancestor scopes only.
+    async fn run_filtered(
+        &self,
+        mut body: Value,
+        req: &GetRequest,
+        opts: &ProjectionOptions,
+    ) -> Result<QueryResult> {
+        let filters = build_filters(req, true);
         if !filters.is_empty() {
             body["filter"] = Value::String(filters.join(" AND "));
         }
-
-        let result = self.run_query(&body, opts).await?;
-        self.bump_accessed(&result.hits).await;
-        Ok(result)
+        match self.run_query(&body, opts).await {
+            Ok(r) => Ok(r),
+            Err(e) if e.to_string().contains("STARTS WITH") => {
+                let filters = build_filters(req, false);
+                body["filter"] = Value::String(filters.join(" AND "));
+                self.run_query(&body, opts).await
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Fetch the full document for a memory by id (the end of the funnel).
@@ -315,7 +368,7 @@ impl MemoryService {
                 // Bump last-accessed; tolerate failure.
                 let _ = self
                     .client
-                    .upsert(&json!({ "id": id, "last_accessed_at": now_secs() }))
+                    .update_many(&[json!({ "id": id, "last_accessed_at": now_secs() })])
                     .await;
                 Ok(serde_json::from_value(doc).ok())
             }
@@ -420,11 +473,24 @@ impl MemoryService {
             scope,
             ..Default::default()
         };
-        let filters = build_filters(&req);
-        if !filters.is_empty() {
-            body["filter"] = Value::String(filters.join(" AND "));
-        }
-        self.run_query(&body, opts).await
+        self.run_filtered(body, &req, opts).await
+    }
+
+    /// Like [`list`](Self::list) but with the full request (extra filters).
+    pub async fn list_with(
+        &self,
+        req: &GetRequest,
+        limit: usize,
+        opts: &ProjectionOptions,
+    ) -> Result<QueryResult> {
+        let mut body = json!({
+            "q": "",
+            "limit": limit,
+            "offset": req.offset.unwrap_or(0),
+            "sort": ["updated_at:desc"],
+        });
+        apply_projection(&mut body, opts);
+        self.run_filtered(body, req, opts).await
     }
 
     /// Store statistics: total document count plus server-side facet
@@ -500,6 +566,7 @@ impl MemoryService {
     }
 
     /// Best-effort bump of `last_accessed_at` for retrieved rows (batched).
+    /// Must be a merge (`PUT`): a replace would wipe the memory down to its id.
     async fn bump_accessed(&self, rows: &[Value]) {
         let now = now_secs();
         let patches: Vec<Value> = rows
@@ -508,7 +575,7 @@ impl MemoryService {
             .map(|id| json!({ "id": id, "last_accessed_at": now }))
             .collect();
         if !patches.is_empty() {
-            let _ = self.client.upsert_many(&patches).await;
+            let _ = self.client.update_many(&patches).await;
         }
     }
 }
@@ -580,6 +647,24 @@ fn derive_title(content: &str) -> Option<String> {
     if title.is_empty() { None } else { Some(title) }
 }
 
+/// Title from a YAML front matter block: `description:` first (what agents
+/// write their memory summaries into), else `name:`/`title:`.
+fn frontmatter_title(content: &str) -> Option<String> {
+    let rest = content.strip_prefix("---")?;
+    let end = rest.find("\n---")?;
+    let block = &rest[..end];
+    let field = |key: &str| {
+        block.lines().find_map(|l| {
+            let v = l.strip_prefix(key)?.trim();
+            let v = v.trim_matches('"').trim_matches('\'').trim();
+            (!v.is_empty()).then(|| v.chars().take(120).collect::<String>())
+        })
+    };
+    field("description:")
+        .or_else(|| field("name:"))
+        .or_else(|| field("title:"))
+}
+
 /// Title for a crawled file: its file name.
 fn file_title(path: &str) -> String {
     std::path::Path::new(path)
@@ -590,14 +675,18 @@ fn file_title(path: &str) -> String {
 }
 
 /// Build a Meilisearch filter expression list from a get/list request.
-fn build_filters(req: &GetRequest) -> Vec<String> {
+///
+/// Scope is hierarchical: a query scoped to `/a/b/c` matches memories scoped
+/// to `/a/b/c`, to any ancestor (`/a/b`, `/a`), to `global`, and — when
+/// `with_subscopes` — to any sub-path (`/a/b/c/…`, e.g. a worktree or a
+/// nested spec directory).
+fn build_filters(req: &GetRequest, with_subscopes: bool) -> Vec<String> {
     let mut f = Vec::new();
     if let Some(ty) = req.r#type {
         f.push(format!("type = '{}'", ty));
     }
     if let Some(scope) = &req.scope {
-        // Path-prefix scoping: exact match (lean path-prefix per PRD open #6).
-        f.push(format!("scope = '{}'", escape(scope)));
+        f.push(scope_filter(scope, with_subscopes));
     }
     if let Some(since) = req.since {
         f.push(format!("created_at >= {since}"));
@@ -605,7 +694,66 @@ fn build_filters(req: &GetRequest) -> Vec<String> {
     if let Some(until) = req.until {
         f.push(format!("created_at <= {until}"));
     }
+    f.extend(req.extra_filters.iter().cloned());
     f
+}
+
+/// The scope clause for `scope` (see [`build_filters`]).
+pub fn scope_filter(scope: &str, with_subscopes: bool) -> String {
+    let scope = normalize_scope(Some(scope));
+    if scope == "global" {
+        return "scope = 'global'".to_string();
+    }
+    let chain: Vec<String> = scope_chain(&scope)
+        .into_iter()
+        .map(|s| format!("'{}'", escape(&s)))
+        .collect();
+    let exact = format!("scope IN [{}]", chain.join(", "));
+    if with_subscopes {
+        format!("({exact} OR scope STARTS WITH '{}/')", escape(&scope))
+    } else {
+        exact
+    }
+}
+
+/// `global` plus every ancestor of `scope` down to itself, shortest first.
+pub fn scope_chain(scope: &str) -> Vec<String> {
+    let mut out = vec!["global".to_string()];
+    if scope == "global" {
+        return out;
+    }
+    let mut acc = String::new();
+    for part in scope.split('/').filter(|p| !p.is_empty()) {
+        acc.push('/');
+        acc.push_str(part);
+        out.push(acc.clone());
+    }
+    if !scope.starts_with('/') && scope != "global" {
+        // Relative/named scope: keep it verbatim too.
+        out.push(scope.to_string());
+    }
+    out
+}
+
+/// Canonical scope string: `global`, or an absolute path with `~` expanded,
+/// no trailing slash, and no `.claude/worktrees/<wt>` segment (a worktree is
+/// the same project as its parent repo).
+pub fn normalize_scope(scope: Option<&str>) -> String {
+    let Some(raw) = scope.map(str::trim).filter(|s| !s.is_empty()) else {
+        return "global".to_string();
+    };
+    if raw.eq_ignore_ascii_case("global") {
+        return "global".to_string();
+    }
+    let expanded = crate::config::expand_tilde(raw)
+        .to_string_lossy()
+        .to_string();
+    let trimmed = expanded.trim_end_matches('/');
+    let s = if trimmed.is_empty() { "/" } else { trimmed };
+    match s.find("/.claude/worktrees/") {
+        Some(i) => s[..i].to_string(),
+        None => s.to_string(),
+    }
 }
 
 /// Escape single quotes in a filter literal.
@@ -637,8 +785,89 @@ mod tests {
             since: Some(100),
             ..Default::default()
         };
-        let f = build_filters(&req);
+        let f = build_filters(&req, true);
         assert!(f.contains(&"type = 'fact'".to_string()));
         assert!(f.contains(&"created_at >= 100".to_string()));
+    }
+
+    #[test]
+    fn scope_chain_includes_global_and_ancestors() {
+        assert_eq!(
+            scope_chain("/a/b/c"),
+            vec!["global", "/a", "/a/b", "/a/b/c"]
+        );
+        assert_eq!(scope_chain("global"), vec!["global"]);
+    }
+
+    #[test]
+    fn scope_filter_matches_ancestors_and_subscopes() {
+        let f = scope_filter("/a/b", true);
+        assert_eq!(
+            f,
+            "(scope IN ['global', '/a', '/a/b'] OR scope STARTS WITH '/a/b/')"
+        );
+        assert_eq!(
+            scope_filter("/a/b", false),
+            "scope IN ['global', '/a', '/a/b']"
+        );
+        assert_eq!(scope_filter("global", true), "scope = 'global'");
+    }
+
+    #[test]
+    fn normalizes_scopes() {
+        assert_eq!(normalize_scope(None), "global");
+        assert_eq!(normalize_scope(Some("  ")), "global");
+        assert_eq!(normalize_scope(Some("Global")), "global");
+        assert_eq!(normalize_scope(Some("/a/b/")), "/a/b");
+        assert_eq!(
+            normalize_scope(Some("/p/memd/.claude/worktrees/wt-1/sub")),
+            "/p/memd"
+        );
+        let home = crate::config::expand_tilde("~/x")
+            .to_string_lossy()
+            .to_string();
+        assert_eq!(normalize_scope(Some("~/x/")), home);
+    }
+
+    #[test]
+    fn frontmatter_titles() {
+        let md = "---\nname: foo\ndescription: \"Why we chose X\"\n---\n\nbody";
+        assert_eq!(frontmatter_title(md).as_deref(), Some("Why we chose X"));
+        assert_eq!(
+            frontmatter_title("---\nname: bar\n---\n").as_deref(),
+            Some("bar")
+        );
+        assert_eq!(frontmatter_title("# plain"), None);
+    }
+
+    #[test]
+    fn prepare_crawled_skips_unchanged_and_keeps_created_at() {
+        let client = MeiliClient::new("http://127.0.0.1:1", "k");
+        let svc = MemoryService::new(client, 0.5);
+        let hash = content_hash("hello");
+        assert!(
+            svc.prepare_crawled(
+                "/r/README.md",
+                "hello".into(),
+                MemoryType::ProjectOverview,
+                "/r".into(),
+                None,
+                Some((&hash, 42))
+            )
+            .is_none()
+        );
+        let item = svc
+            .prepare_crawled(
+                "/r/README.md",
+                "changed".into(),
+                MemoryType::ProjectOverview,
+                "/r/".into(),
+                None,
+                Some((&hash, 42)),
+            )
+            .unwrap();
+        assert_eq!(item.created_at, 42);
+        assert_eq!(item.scope, "/r");
+        assert_eq!(item.title.as_deref(), Some("README.md"));
     }
 }

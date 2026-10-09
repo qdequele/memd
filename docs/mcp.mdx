@@ -36,7 +36,25 @@ which to connect. Each selected agent gets memd's MCP server registered (HTTP
 endpoint), plus usage directives and lifecycle hooks where supported. The
 checklist is the source of truth: un-checking a previously connected agent
 removes memd from it. In a non-interactive shell (CI, piped), `setup` connects
-every detected agent and removes nothing.
+every detected agent and removes nothing. To script an explicit selection:
+`memd setup --agents claude-code,codex` (unlisted agents are left as they are).
+
+| Agent | MCP | Directives | Session-start hook | End-of-turn capture | Memory files indexed |
+|-------|-----|------------|--------------------|---------------------|----------------------|
+| Claude Code | `claude mcp add` | `~/.claude/CLAUDE.md` | `SessionStart` | `Stop` | `~/.claude/projects/*/memory` |
+| Codex | `~/.codex/config.toml` | `~/.codex/AGENTS.md` | `SessionStart` (`~/.codex/hooks.json`) | `Stop` | `~/.codex/memories` |
+| Gemini CLI | `~/.gemini/settings.json` | `~/.gemini/GEMINI.md` | `SessionStart` (JSON output) | `AfterAgent` | — |
+| Cursor | `~/.cursor/mcp.json` | — (rules live in the UI) | — | — | — |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | `…/memories/global_rules.md` | — | — | `~/.codeium/windsurf/memories` |
+| Cline | `cline_mcp_settings.json` | `~/Documents/Cline/Rules/memd.md` | — | — | `~/Documents/Cline/Rules` |
+| Zed | `~/.config/zed/settings.json` | — | — | — | — |
+
+Codex asks you to trust new hooks once (`/hooks` inside Codex). Gemini CLI
+hooks are experimental; `memd setup` sets the two flags that enable them.
+
+Agents without hooks still get memory two ways: the MCP server's `initialize`
+instructions, and the directive block in their instruction file. Both tell the
+model to recall at task start and save durable facts.
 
 Run `memd status` to see each agent's wiring state (`configured`, `detected —
 not configured`, or `not detected`).
@@ -74,7 +92,7 @@ rows**: metadata plus a query-aware ~50-word highlighted **snippet** of
   "limit": 5,
   "offset": 0,
   "type": "decision",
-  "scope": "~/Projects/app",
+  "scope": "~/Projects/app",   // matches this path, its parents, sub-paths, and global
   "since": 1714521600,
   "until": 1717200000,
   "semantic_ratio": 0.5,

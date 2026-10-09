@@ -10,6 +10,26 @@ use std::time::Duration;
 
 pub const INDEX: &str = "memories";
 
+/// Format unix seconds as an RFC 3339 UTC timestamp (what the tasks API
+/// expects), without pulling in a date crate.
+fn chrono_like(secs: i64) -> String {
+    // Civil-from-days algorithm (Howard Hinnant), good for any modern date.
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m, s) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
 #[derive(Clone)]
 pub struct MeiliClient {
     http: reqwest::Client,
@@ -135,6 +155,13 @@ impl MeiliClient {
         let _ = self
             .patch("/experimental-features", &json!({ "vectorStore": true }))
             .await;
+        // `STARTS WITH` filters (used for sub-scope recall) are gated behind
+        // the `containsFilter` experimental feature. memd owns this engine, so
+        // enabling it is safe; the service falls back to exact scopes if the
+        // engine rejects the filter anyway.
+        let _ = self
+            .patch("/experimental-features", &json!({ "containsFilter": true }))
+            .await;
 
         self.create_index().await;
 
@@ -226,6 +253,91 @@ impl MeiliClient {
         if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
             self.wait_task(uid).await?;
         }
+        Ok(())
+    }
+
+    /// Merge partial documents into existing ones (`PUT`, add-or-update) and
+    /// wait for completion. Unlike [`upsert_many`](Self::upsert_many), which is
+    /// add-or-*replace*, fields absent from a partial doc are preserved — so a
+    /// `{ id, last_accessed_at }` patch never wipes a memory's content.
+    pub async fn update_many<T: Serialize>(&self, docs: &[T]) -> Result<()> {
+        let v = self
+            .http
+            .put(self.url(&format!("/indexes/{}/documents", self.index)))
+            .bearer_auth(&self.key)
+            .json(&docs)
+            .send()
+            .await?;
+        let v = Self::json_or_err(v).await.context("updating documents")?;
+        if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
+            self.wait_task(uid).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetch every document matching `filter`, projected to `fields`, paging
+    /// through the index 1000 at a time. Used by the crawler to load its
+    /// existing state in a handful of requests instead of one GET per file.
+    pub async fn fetch_docs(&self, filter: &str, fields: &[&str]) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let body = json!({
+                "filter": filter,
+                "fields": fields,
+                "limit": 1000,
+                "offset": offset,
+            });
+            let resp = self
+                .post(&format!("/indexes/{}/documents/fetch", self.index), &body)
+                .await
+                .context("fetching documents")?;
+            let results = resp
+                .get("results")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let n = results.len();
+            out.extend(results);
+            if n < 1000 {
+                break;
+            }
+            offset += n;
+        }
+        Ok(out)
+    }
+
+    /// Delete every document matching `filter` in one task. Returns how many
+    /// were removed.
+    pub async fn delete_by_filter(&self, filter: &str) -> Result<usize> {
+        let v = self
+            .post(
+                &format!("/indexes/{}/documents/delete", self.index),
+                &json!({ "filter": filter }),
+            )
+            .await
+            .context("deleting documents by filter")?;
+        if let Some(uid) = v.get("taskUid").and_then(|t| t.as_u64()) {
+            let task = self.wait_task(uid).await?;
+            let deleted = task
+                .get("details")
+                .and_then(|d| d.get("deletedDocuments"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(0);
+            return Ok(deleted as usize);
+        }
+        Ok(0)
+    }
+
+    /// Drop finished tasks older than `before_unix_secs` from the engine's task
+    /// history (the memory store itself is untouched). Best-effort.
+    pub async fn prune_tasks(&self, before_unix_secs: i64) -> Result<()> {
+        let ts = chrono_like(before_unix_secs);
+        let _ = self
+            .delete(&format!(
+                "/tasks?statuses=succeeded,failed,canceled&beforeEnqueuedAt={ts}"
+            ))
+            .await?;
         Ok(())
     }
 
@@ -333,5 +445,16 @@ impl MeiliClient {
             }
         }
         bail!("Meilisearch task {} did not complete in time", uid)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_rfc3339() {
+        assert_eq!(chrono_like(0), "1970-01-01T00:00:00Z");
+        assert_eq!(chrono_like(1_791_485_718), "2026-10-08T18:55:18Z");
     }
 }

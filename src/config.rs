@@ -68,7 +68,9 @@ pub struct EmbedderConfig {
 pub struct CrawlerConfig {
     /// Roots to scan (supports a leading `~`).
     pub roots: Vec<String>,
-    /// Directory names to skip entirely.
+    /// Directory names (`node_modules`) or trailing path fragments
+    /// (`.claude/worktrees`) to skip entirely. Linked git worktrees are always
+    /// skipped.
     pub exclude_dirs: Vec<String>,
     /// Maximum file size to index, in bytes.
     pub max_file_bytes: u64,
@@ -131,6 +133,10 @@ impl Default for CrawlerConfig {
                 "venv",
                 "__pycache__",
                 ".cache",
+                // Agent worktrees are copies of repositories that are already
+                // indexed (any linked git worktree is skipped regardless).
+                ".claude/worktrees",
+                ".cursor/worktrees",
             ]
             .into_iter()
             .map(String::from)
