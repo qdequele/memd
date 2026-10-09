@@ -1,15 +1,20 @@
 //! The knowledge service: entities, relations, and their links to memories.
 
+use super::explore::{MAX_RELATED, shape};
+use super::ident::in_filter;
 use super::ident::{
     entity_id, is_entity_id, key_of, normalize_predicate, relation_id, slug, validate_kind,
 };
 use super::relations::{Relation, RelationStore};
+use super::resolve::ENTITY_ROW_FIELDS;
 use super::resolve::{Resolution, ambiguity_message, resolve};
 use crate::history::{EventAction, MemoryEvent};
 use crate::memory::model::now_secs;
 use crate::memory::service::{content_hash, normalize_scope};
+use crate::memory::{GetRequest, MemoryType, ProjectionOptions};
 use crate::memory::{Knowledge, MemoryItem, MemoryService, Source};
 use anyhow::{Result, anyhow, bail};
+use serde_json::{Value, json};
 
 /// A relation as an agent states it: names or ids for both ends.
 #[derive(Debug, Clone, Default)]
@@ -336,6 +341,105 @@ impl KnowledgeService {
                 .await;
         }
         warnings
+    }
+
+    /// Everything memd knows about one entity. Depth is clamped to 1..=2 and
+    /// the memory limit to 1..=50.
+    pub async fn explore(
+        &self,
+        name: &str,
+        depth: u8,
+        limit: usize,
+        scope: Option<&str>,
+    ) -> Result<Value> {
+        let depth = depth.clamp(1, 2);
+        let limit = limit.clamp(1, 50);
+        let id = match resolve(&self.mem, name, scope).await? {
+            Resolution::Found(id) => id,
+            Resolution::Ambiguous(c) => bail!(ambiguity_message(name, &c)),
+            Resolution::NotFound => {
+                let req = GetRequest {
+                    query: name.to_string(),
+                    limit: Some(5),
+                    r#type: Some(MemoryType::Entity),
+                    ..Default::default()
+                };
+                let hits = self
+                    .mem
+                    .get(req, &ProjectionOptions::search_default())
+                    .await
+                    .map(|r| r.hits)
+                    .unwrap_or_default();
+                return Ok(json!({ "entity": Value::Null, "suggestions": hits }));
+            }
+        };
+
+        let entity = self
+            .mem
+            .get_item(&id)
+            .await?
+            .ok_or_else(|| anyhow!("entity `{id}` disappeared"))?;
+        let one = std::slice::from_ref(&id);
+        let outgoing = self.rel.by_subjects(one).await?;
+        let incoming = self.rel.by_objects(one).await?;
+
+        let mut neighbour_ids: Vec<String> = outgoing
+            .iter()
+            .map(|r| r.object.clone())
+            .chain(incoming.iter().map(|r| r.subject.clone()))
+            .chain(entity.knowledge.owner.clone())
+            .filter(|n| n != &id)
+            .collect();
+        neighbour_ids.sort();
+        neighbour_ids.dedup();
+        neighbour_ids.truncate(MAX_RELATED);
+
+        let related = if neighbour_ids.is_empty() {
+            Vec::new()
+        } else {
+            self.mem
+                .client()
+                .fetch_docs(&in_filter("id", &neighbour_ids), ENTITY_ROW_FIELDS)
+                .await?
+        };
+
+        let memories = self
+            .mem
+            .list_with(
+                &GetRequest {
+                    entity: Some(id.clone()),
+                    extra_filters: vec!["type != 'entity'".to_string()],
+                    ..Default::default()
+                },
+                limit,
+                &ProjectionOptions {
+                    include_content: false,
+                    crop_length: Some(40),
+                    highlight: false,
+                    facets: Vec::new(),
+                },
+            )
+            .await?
+            .hits;
+
+        let second: Option<Vec<Relation>> = if depth == 2 && !neighbour_ids.is_empty() {
+            let mut edges = self.rel.by_subjects(&neighbour_ids).await?;
+            edges.extend(self.rel.by_objects(&neighbour_ids).await?);
+            edges.sort_by(|a, b| a.id.cmp(&b.id));
+            edges.dedup_by(|a, b| a.id == b.id);
+            Some(edges)
+        } else {
+            None
+        };
+
+        Ok(shape(
+            serde_json::to_value(&entity)?,
+            &outgoing,
+            &incoming,
+            related,
+            memories,
+            second.as_deref(),
+        ))
     }
 
     /// Delete one relation, by names or ids. Unknown endpoints mean there is

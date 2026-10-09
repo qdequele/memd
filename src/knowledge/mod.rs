@@ -10,3 +10,4 @@ pub mod resolve;
 pub mod service;
 #[allow(unused_imports)] // first user: MCP layer, Task 8; removed there
 pub use service::KnowledgeService;
+pub mod explore;
