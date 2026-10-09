@@ -324,6 +324,46 @@ impl MemoryService {
         }
     }
 
+    /// Fetch a memory without bumping `last_accessed_at`.
+    pub async fn get_item(&self, id: &str) -> Result<Option<MemoryItem>> {
+        Ok(self
+            .client
+            .get_doc(id)
+            .await?
+            .and_then(|d| serde_json::from_value(d).ok()))
+    }
+
+    /// Write an entity document as-is and record the mutation. Unlike
+    /// [`save`](Self::save) this never dedups on content: two entities can
+    /// legitimately share (empty) content.
+    pub async fn put_entity(&self, item: &MemoryItem, created: bool) -> Result<()> {
+        self.client.upsert(item).await?;
+        self.record_mutation(
+            if created {
+                EventAction::Create
+            } else {
+                EventAction::Update
+            },
+            &item.id,
+            item.title.clone(),
+            Some(item.r#type.clone()),
+            Some(item.scope.clone()),
+            Source::parse(&item.source).unwrap_or(Source::Cli),
+            item.source_client.clone(),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Merge partial documents into existing ones (`PUT`).
+    #[allow(dead_code)] // first caller: Task 7; removed there
+    pub async fn patch(&self, patches: &[Value]) -> Result<()> {
+        if patches.is_empty() {
+            return Ok(());
+        }
+        self.client.update_many(patches).await
+    }
+
     /// Upsert a batch of documents in one Meilisearch task (one embedding pass
     /// for the whole batch — far faster than per-document during a full crawl).
     pub async fn upsert_batch(&self, items: &[MemoryItem]) -> Result<()> {

@@ -106,7 +106,6 @@ impl MemoryEvent {
     }
 
     /// A relation added or removed. `memory_id` is the subject entity.
-    #[allow(dead_code)] // first non-test caller arrives in Task 5; removed there
     pub fn relation(action: EventAction, rel: &crate::knowledge::relations::Relation) -> Self {
         Self {
             id: uuid::Uuid::now_v7().to_string(),

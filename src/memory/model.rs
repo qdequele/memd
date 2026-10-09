@@ -73,6 +73,16 @@ pub enum Source {
 }
 
 impl Source {
+    /// Parse a stored source string.
+    pub fn parse(s: &str) -> Option<Source> {
+        match s {
+            "mcp" => Some(Source::Mcp),
+            "crawler" => Some(Source::Crawler),
+            "cli" => Some(Source::Cli),
+            _ => None,
+        }
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Source::Mcp => "mcp",
