@@ -26,6 +26,10 @@ dated when it matters. Set `type` (`decision`, `preference`, `fact`, `task`) and
 - **Don't save** what is already on disk (code, README, instruction files) or \
 only matters to the current conversation. Search before saving; `update_memory` a \
 near-duplicate instead of adding another.\n\
+- **Name things.** When you save, list the entities involved (`entities`) and any \
+relation you learned (`relations`); use `save_entity` for a company, team, person, \
+project, product, service, customer or concept. Before asking the user what \
+something is, call `explore` with its name.\n\
 - `read_memory(id)` returns the full text; `list_memories` browses.\n\
 {DIRECTIVE_END}"
     )
@@ -111,6 +115,7 @@ mod tests {
         let after = std::fs::read_to_string(&p).unwrap();
         assert!(after.contains("keep me"));
         assert!(after.contains("## Memory (memd)"));
+        assert!(after.contains("explore"));
         // Idempotent: second upsert doesn't duplicate the block.
         upsert_directive(&p).unwrap();
         let twice = std::fs::read_to_string(&p).unwrap();

@@ -503,32 +503,8 @@ impl MemoryService {
         Ok(true)
     }
 
-    /// List memories matching optional filters (most recent first). Returns
+    /// List memories matching a request (most recent first). Returns
     /// metadata-only rows by default — token-safe regardless of `limit`.
-    pub async fn list(
-        &self,
-        ty: Option<MemoryType>,
-        scope: Option<String>,
-        limit: usize,
-        offset: usize,
-        opts: &ProjectionOptions,
-    ) -> Result<QueryResult> {
-        let mut body = json!({
-            "q": "",
-            "limit": limit,
-            "offset": offset,
-            "sort": ["updated_at:desc"],
-        });
-        apply_projection(&mut body, opts);
-        let req = GetRequest {
-            r#type: ty,
-            scope,
-            ..Default::default()
-        };
-        self.run_filtered(body, &req, opts).await
-    }
-
-    /// Like [`list`](Self::list) but with the full request (extra filters).
     pub async fn list_with(
         &self,
         req: &GetRequest,
