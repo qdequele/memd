@@ -5,3 +5,4 @@
 //! module normalises identities, resolves names, and answers `explore`.
 
 pub mod ident;
+pub mod relations;

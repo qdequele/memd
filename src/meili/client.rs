@@ -198,6 +198,21 @@ impl MeiliClient {
         self.apply_settings(&settings).await
     }
 
+    /// Ensure the `memory_relations` index exists with its settings. No
+    /// embedder. Idempotent; safe on every daemon start.
+    pub async fn ensure_relations_index(&self) -> Result<()> {
+        self.create_index().await;
+        let settings = json!({
+            "searchableAttributes": ["note", "predicate"],
+            "filterableAttributes": [
+                "id", "subject", "predicate", "object", "source", "source_client",
+                "scope", "created_at", "updated_at"
+            ],
+            "sortableAttributes": ["created_at", "updated_at"],
+        });
+        self.apply_settings(&settings).await
+    }
+
     /// Create `self.index` (ignoring "already exists").
     async fn create_index(&self) {
         let create = self

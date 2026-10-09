@@ -26,6 +26,10 @@ pub enum EventAction {
     Delete,
     /// A crawl pass — one summary event, not one per file.
     Crawl,
+    /// A relation was added.
+    Relate,
+    /// A relation was removed.
+    Unrelate,
 }
 
 impl EventAction {
@@ -35,6 +39,8 @@ impl EventAction {
             EventAction::Update => "update",
             EventAction::Delete => "delete",
             EventAction::Crawl => "crawl",
+            EventAction::Relate => "relate",
+            EventAction::Unrelate => "unrelate",
         }
     }
 
@@ -45,6 +51,8 @@ impl EventAction {
             "update" | "updated" | "edit" => Some(EventAction::Update),
             "delete" | "deleted" | "forget" | "remove" => Some(EventAction::Delete),
             "crawl" | "crawled" => Some(EventAction::Crawl),
+            "relate" | "related" | "link" => Some(EventAction::Relate),
+            "unrelate" | "unlink" => Some(EventAction::Unrelate),
             _ => None,
         }
     }
@@ -94,6 +102,23 @@ impl MemoryEvent {
             source: source.as_str().to_string(),
             source_client,
             detail: None,
+        }
+    }
+
+    /// A relation added or removed. `memory_id` is the subject entity.
+    #[allow(dead_code)] // first non-test caller arrives in Task 5; removed there
+    pub fn relation(action: EventAction, rel: &crate::knowledge::relations::Relation) -> Self {
+        Self {
+            id: uuid::Uuid::now_v7().to_string(),
+            ts: now_secs(),
+            action: action.as_str().to_string(),
+            memory_id: Some(rel.subject.clone()),
+            title: Some(format!("{} {} {}", rel.subject, rel.predicate, rel.object)),
+            r#type: None,
+            scope: Some(rel.scope.clone()),
+            source: rel.source.clone(),
+            source_client: rel.source_client.clone(),
+            detail: rel.note.clone(),
         }
     }
 
